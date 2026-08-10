@@ -20,7 +20,9 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.wuji_policy as wuji_policy
 import openpi.shared.download as _download
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
@@ -28,6 +30,11 @@ import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
+
+# RoboDojo normalization assets bundled with this adapter (openpi/assets/RoboDojo_assets).
+_ROBODOJO_ASSETS_DIR = pathlib.Path(__file__).resolve().parents[3] / "assets" / "RoboDojo_assets"
+# Norm stats for Tianji Marvin + Wuji Hand (written by compute_norm_stats).
+_WUJI_ASSETS_DIR = pathlib.Path(__file__).resolve().parents[3] / "assets" / "Wuji_assets"
 
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
@@ -65,6 +72,9 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Video decoder backend for LeRobot datasets. Forced to pyav by default because
+    # torchcodec is present in some environments but not fully functional at runtime.
+    video_backend: Literal["pyav", "torchcodec", "video_reader"] = "pyav"
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -235,7 +245,7 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     # If true, this will convert the joint and gripper values from the standard Aloha space to
     # the space used by the pi internal runtime which was used to train the base model. People who
     # use standard Aloha data should set this to true.
-    adapt_to_pi: bool = True
+    adapt_to_pi: bool = False
 
     # Repack transforms.
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
@@ -352,6 +362,66 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotWujiDataConfig(DataConfigFactory):
+    """
+    Config for Tianji Marvin + dual Wuji Hand Gen1 (adapted from wuji-openpi).
+
+    Dataset features:
+    - observation.state: 54 dims (7 left arm + 20 left hand + 7 right arm + 20 right hand)
+    - action: 54 dims
+    - observation.images.cam_left_wrist / cam_right_wrist
+    - base camera: observation.images.stereo_right (default) or cam_high via base_image_key
+
+    Requires model.action_dim=54. Load pi05_base with PartialCheckpointWeightLoader.
+    """
+
+    extra_delta_transform: bool = False
+    # LeRobot key for the head / stereo base camera.
+    base_image_key: str = "observation.images.stereo_right"
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": self.base_image_key,
+                        "observation/left_wrist_image": "observation.images.cam_left_wrist",
+                        "observation/right_wrist_image": "observation.images.cam_right_wrist",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[wuji_policy.WujiInputs(model_type=model_config.model_type)],
+            outputs=[wuji_policy.WujiOutputs(action_dim=model_config.action_dim)],
+        )
+
+        # Arms: delta; hands: absolute (same as wuji-openpi).
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(7, -20, 7, -20)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
         )
 
 
@@ -499,6 +569,9 @@ class TrainConfig:
     assets_base_dir: str = "./assets"
     # Base directory for checkpoints.
     checkpoint_base_dir: str = "./checkpoints"
+    # Optional exact checkpoint directory. XPolicyLab train.sh uses this to
+    # keep policy checkpoints under policy/<name>/checkpoints/<6-tuple>.
+    checkpoint_dir_override: str | None = None
 
     # Random seed that will be used by random generators during training.
     seed: int = 42
@@ -506,7 +579,7 @@ class TrainConfig:
     batch_size: int = 32
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
-    num_workers: int = 2
+    num_workers: int = 8
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
 
@@ -544,6 +617,8 @@ class TrainConfig:
         """Get the checkpoint directory for this config."""
         if not self.exp_name:
             raise ValueError("--exp_name must be set")
+        if self.checkpoint_dir_override:
+            return pathlib.Path(self.checkpoint_dir_override).resolve()
         return (pathlib.Path(self.checkpoint_base_dir) / self.name / self.exp_name).resolve()
 
     @property
@@ -558,253 +633,50 @@ class TrainConfig:
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
-    #
-    # Inference Aloha configs.
-    #
     TrainConfig(
-        name="pi0_aloha",
-        model=pi0_config.Pi0Config(),
-        data=LeRobotAlohaDataConfig(
-            assets=AssetsConfig(asset_id="trossen"),
-        ),
-        policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
-    ),
-    TrainConfig(
-        name="pi05_aloha",
+        name="pi05_base_aloha_full_sim_arx-x5_seed_0",
         model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotAlohaDataConfig(
-            assets=AssetsConfig(asset_id="trossen"),
-        ),
-        policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
-    ),
-    TrainConfig(
-        name="pi0_aloha_towel",
-        model=pi0_config.Pi0Config(),
-        data=LeRobotAlohaDataConfig(
-            assets=AssetsConfig(asset_id="trossen"),
-            default_prompt="fold the towel",
-        ),
-        policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
-    ),
-    TrainConfig(
-        name="pi0_aloha_tupperware",
-        model=pi0_config.Pi0Config(),
-        data=LeRobotAlohaDataConfig(
-            assets=AssetsConfig(asset_id="trossen"),
-            default_prompt="open the tupperware and put the food on the plate",
-        ),
-        policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
-    ),
-    #
-    # Inference DROID configs.
-    #
-    TrainConfig(
-        name="pi0_droid",
-        model=pi0_config.Pi0Config(action_horizon=10),
-        data=SimpleDataConfig(
-            assets=AssetsConfig(asset_id="droid"),
-            data_transforms=lambda model: _transforms.Group(
-                inputs=[droid_policy.DroidInputs(model_type=ModelType.PI0)],
-                outputs=[droid_policy.DroidOutputs()],
+            repo_id="RoboDojo_sim_arx-x5_v30",
+            assets=AssetsConfig(
+                assets_dir=str(_ROBODOJO_ASSETS_DIR),
+                asset_id="arx_x5_sim",
+            ),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
             ),
             base_config=DataConfig(
-                prompt_from_task=True,
+                prompt_from_task=True,  # Set to True for prompt by task_name
             ),
         ),
-    ),
-    TrainConfig(
-        name="pi0_fast_droid",
-        model=pi0_fast.Pi0FASTConfig(action_dim=8, action_horizon=10),
-        data=SimpleDataConfig(
-            assets=AssetsConfig(asset_id="droid"),
-            data_transforms=lambda model: _transforms.Group(
-                inputs=[droid_policy.DroidInputs(model_type=ModelType.PI0_FAST)],
-                outputs=[droid_policy.DroidOutputs()],
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-            ),
-        ),
-    ),
-    TrainConfig(
-        name="pi05_droid",
-        model=pi0_config.Pi0Config(action_horizon=15, pi05=True),
-        data=SimpleDataConfig(
-            assets=AssetsConfig(asset_id="droid"),
-            data_transforms=lambda model: _transforms.Group(
-                inputs=[droid_policy.DroidInputs(model_type=ModelType.PI05)],
-                outputs=[droid_policy.DroidOutputs()],
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-            ),
-        ),
-    ),
-    #
-    # Fine-tuning Libero configs.
-    #
-    # These train configs define the hyperparameters for fine-tuning the base model on your own dataset.
-    # They are used to define key elements like the dataset you are training on, the base checkpoint you
-    # are using, and other hyperparameters like how many training steps to run or what learning rate to use.
-    # For your own dataset, you can copy this class and modify the dataset name, and data transforms based on
-    # the comments below.
-    TrainConfig(
-        # Change the name to reflect your model and dataset.
-        name="pi0_libero",
-        # Here you define the model config -- In this example we use pi0 as the model
-        # architecture and perform *full* finetuning. in the examples below we show how to modify
-        # this to perform *low-memory* (LORA) finetuning and use pi0-FAST as an alternative architecture.
-        model=pi0_config.Pi0Config(),
-        # Here you define the dataset you are training on. In this example we use the Libero
-        # dataset. For your own dataset, you can change the repo_id to point to your dataset.
-        # Also modify the DataConfig to use the new config you made for your dataset above.
-        data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
-            base_config=DataConfig(
-                # This flag determines whether we load the prompt (i.e. the task instruction) from the
-                # ``task`` field in the LeRobot dataset. If set to True, the prompt will show up in
-                # a field called ``prompt`` in the input dict. The recommended setting is True.
-                prompt_from_task=True,
-            ),
-            extra_delta_transform=True,
-        ),
-        # Here you define which pre-trained checkpoint you want to load to initialize the model.
-        # This should match the model config you chose above -- i.e. in this case we use the pi0 base model.
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        # Below you can define other hyperparameters like the learning rate, number of training steps, etc.
-        # Check the base TrainConfig class for a full list of available hyperparameters.
-        num_train_steps=30_000,
-    ),
-    TrainConfig(
-        name="pi0_libero_low_mem_finetune",
-        # Here is an example of loading a pi0 model for LoRA fine-tuning.
-        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
-        data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
-            base_config=DataConfig(prompt_from_task=True),
-            extra_delta_transform=True,
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=30_000,
-        # The freeze filter defines which parameters should be frozen during training.
-        # We have a convenience function in the model config that returns the default freeze filter
-        # for the given model config for LoRA finetuning. Just make sure it matches the model config
-        # you chose above.
-        freeze_filter=pi0_config.Pi0Config(
-            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
-        ).get_freeze_filter(),
-        # Turn off EMA for LoRA finetuning.
-        ema_decay=None,
-    ),
-    TrainConfig(
-        name="pi0_fast_libero",
-        # Here is an example of loading a pi0-FAST model for full finetuning.
-        # Modify action_dim and action_horizon to match your dataset (action horizon is equal to
-        # the desired action chunk length).
-        # The max_token_len is the maximum number of (non-image) tokens the model can handle.
-        # This includes the tokenized prompt, proprioceptive state, and (FAST-tokenized) action tokens.
-        # Choosing this value too small may chop off tokens at the end of your sequence (the code will throw
-        # a warning), while choosing it too large will waste memory (since we pad each batch element to the
-        # max_token_len). A good rule of thumb is to use approx 180 for single-arm robots, and approx 250 for
-        # two-arm robots. Generally, err on the lower side here first, and potentially increase the value if
-        # you see many warnings being thrown during training.
-        model=pi0_fast.Pi0FASTConfig(action_dim=7, action_horizon=10, max_token_len=180),
-        data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
-            base_config=DataConfig(prompt_from_task=True),
-            extra_delta_transform=True,
-        ),
-        # Note that we load the pi0-FAST base model checkpoint here.
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
-        num_train_steps=30_000,
-    ),
-    TrainConfig(
-        name="pi0_fast_libero_low_mem_finetune",
-        # Here is an example of loading a pi0-FAST model for LoRA finetuning.
-        # For setting action_dim, action_horizon, and max_token_len, see the comments above.
-        model=pi0_fast.Pi0FASTConfig(
-            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
-        ),
-        data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
-            base_config=DataConfig(prompt_from_task=True),
-            extra_delta_transform=True,
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
-        num_train_steps=30_000,
-        # Again, make sure to match the model config above when extracting the freeze filter
-        # that specifies which parameters should be frozen during LoRA finetuning.
-        freeze_filter=pi0_fast.Pi0FASTConfig(
-            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
-        ).get_freeze_filter(),
-        # Turn off EMA for LoRA finetuning.
-        ema_decay=None,
-    ),
-    TrainConfig(
-        name="pi05_libero",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
-        data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
-            base_config=DataConfig(prompt_from_task=True),
-            extra_delta_transform=False,
-        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        seed=0,
         batch_size=256,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
-            peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
-        num_train_steps=30_000,
-    ),
-    #
-    # Fine-tuning Aloha configs.
-    #
-    # This is a test config that is used to illustate how train on a custom LeRobot dataset.
-    # For instructions on how to convert and train on your own Aloha dataset see examples/aloha_real/README.md
-    TrainConfig(
-        name="pi0_aloha_pen_uncap",
-        model=pi0_config.Pi0Config(),
-        data=LeRobotAlohaDataConfig(
-            repo_id="physical-intelligence/aloha_pen_uncap_diverse",
-            assets=AssetsConfig(
-                assets_dir="gs://openpi-assets/checkpoints/pi0_base/assets",
-                asset_id="trossen",
-            ),
-            default_prompt="uncap the pen",
-            repack_transforms=_transforms.Group(
-                inputs=[
-                    _transforms.RepackTransform(
-                        {
-                            "images": {
-                                "cam_high": "observation.images.cam_high",
-                                "cam_left_wrist": "observation.images.cam_left_wrist",
-                                "cam_right_wrist": "observation.images.cam_right_wrist",
-                            },
-                            "state": "observation.state",
-                            "actions": "action",
-                        }
-                    )
-                ]
-            ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=20_000,
+        fsdp_devices=2,
+        num_train_steps=60000,
     ),
     TrainConfig(
-        name="pi05_aloha_pen_uncap",
+        name="pi05_base_aloha_full_sim_arx-x5_seed_1",
         model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotAlohaDataConfig(
-            repo_id="physical-intelligence/aloha_pen_uncap_diverse",
+            repo_id="RoboDojo_sim_arx-x5_v30",
             assets=AssetsConfig(
-                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
-                asset_id="trossen",
+                assets_dir=str(_ROBODOJO_ASSETS_DIR),
+                asset_id="arx_x5_sim",
             ),
-            default_prompt="uncap the pen",
             repack_transforms=_transforms.Group(
                 inputs=[
                     _transforms.RepackTransform(
@@ -816,159 +688,233 @@ _CONFIGS = [
                             },
                             "state": "observation.state",
                             "actions": "action",
+                            "prompt": "prompt",
                         }
                     )
                 ]
             ),
+            base_config=DataConfig(
+                prompt_from_task=True,  # Set to True for prompt by task_name
+            ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=20_000,
+        seed=1,
+        batch_size=256,
+        fsdp_devices=2,
+        num_train_steps=60000,
+    ),
+    TrainConfig(
+        name="pi05_base_aloha_full_sim_arx-x5_seed_2",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id="RoboDojo_sim_arx-x5_v30",
+            assets=AssetsConfig(
+                assets_dir=str(_ROBODOJO_ASSETS_DIR),
+                asset_id="arx_x5_sim",
+            ),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,  # Set to True for prompt by task_name
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        seed=2,
+        batch_size=256,
+        fsdp_devices=2,
+        num_train_steps=60000,
+    ),
+    # Tianji Marvin + dual Wuji Hand Gen1 (54D). Set data.repo_id to your LeRobot dataset
+    # before compute_norm_stats / train. Skip RoboDojo process_data.py; use wuji mcap→LeRobot.
+    TrainConfig(
+        name="pi05_wuji_marvin_54d",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=54, action_horizon=50, max_token_len=256),
+        data=LeRobotWujiDataConfig(
+            # Replace with your LeRobot repo id or local dataset id under HF_LEROBOT_HOME.
+            repo_id="tianji_marvin_wuji",
+            assets=AssetsConfig(
+                assets_dir=str(_WUJI_ASSETS_DIR),
+                asset_id="tianji_marvin_wuji",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            extra_delta_transform=True,
+            # If your dataset uses cam_high instead of stereo_right, set:
+            # base_image_key="observation.images.cam_high",
+        ),
+        weight_loader=weight_loaders.PartialCheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=30_000,
         batch_size=64,
-    ),
-    #
-    # Fine-tuning DROID configs.
-    #
-    TrainConfig(
-        # This config is for fine-tuning pi0-FAST-base on the *full* DROID dataset.
-        # We use RLDS data loading to make training on this large dataset tractable.
-        # For fine-tuning on your own DROID dataset, see below.
-        name="pi0_fast_full_droid_finetune",
-        model=pi0_fast.Pi0FASTConfig(
-            action_dim=8,
-            action_horizon=16,
-            max_token_len=180,
-        ),
-        data=RLDSDroidDataConfig(
-            repo_id="droid",
-            # Set this to the path to your DROID RLDS dataset (the parent directory of the `droid` directory).
-            rlds_data_dir="<path_to_droid_rlds_dataset>",
-            action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
             peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
         ),
-        num_train_steps=100_000,  # 100k steps should be sufficient, takes ~2 days on 8x H100s
-        batch_size=256,
-        log_interval=100,
-        save_interval=5000,
-        keep_period=20_000,
-        num_workers=0,  # Important: RLDS DataLoader requires num_workers=0, handles multi-processing internally
     ),
-    TrainConfig(
-        # This config is for fine-tuning pi05 on the *full* DROID dataset.
-        # We use RLDS data loading to make training on this large dataset tractable.
-        # For fine-tuning on your own DROID dataset, see below.
-        name="pi05_full_droid_finetune",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=16,
-        ),
-        data=RLDSDroidDataConfig(
-            repo_id="droid",
-            # Set this to the path to your DROID RLDS dataset (the parent directory of the `droid` directory).
-            rlds_data_dir="/mnt/pi-data/kevin",
-            action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
-            assets=AssetsConfig(
-                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets/",
-                asset_id="droid",
-            ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
-        ),
-        num_train_steps=100_000,
-        batch_size=256,
-        log_interval=100,
-        save_interval=5000,
-        keep_period=10_000,
-        num_workers=0,  # Important: RLDS DataLoader requires num_workers=0, handles multi-processing internally
-    ),
-    TrainConfig(
-        # This config is for fine-tuning pi05-DROID on a custom (smaller) DROID dataset.
-        # Here, we use LeRobot data format (like for all other fine-tuning examples)
-        # To convert your custom DROID dataset (<10s of hours) to LeRobot format, see examples/droid/convert_droid_data_to_lerobot.py
-        name="pi05_droid_finetune",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,  # pi05 is trained with 32-dim actions
-            action_horizon=16,
-        ),
-        data=LeRobotDROIDDataConfig(
-            # Replace with your custom DROID LeRobot dataset repo id.
-            repo_id="your_hf_username/my_droid_dataset",
-            base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(
-                # Important: reuse the original DROID norm stats during fine-tuning!
-                assets_dir="gs://openpi-assets/checkpoints/pi05_droid/assets",
-                asset_id="droid",
-            ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
-        num_train_steps=20_000,
-        batch_size=32,
-    ),
-    #
-    # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
-    #
-    TrainConfig(
-        name="pi0_aloha_sim",
-        model=pi0_config.Pi0Config(),
-        data=LeRobotAlohaDataConfig(
-            repo_id="lerobot/aloha_sim_transfer_cube_human",
-            default_prompt="Transfer cube",
-            use_delta_joint_actions=False,
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=20_000,
-    ),
-    #
-    # Debugging configs.
-    #
-    TrainConfig(
-        name="debug",
-        data=FakeDataConfig(),
-        batch_size=2,
-        model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
-        save_interval=100,
-        overwrite=True,
-        exp_name="debug",
-        num_train_steps=10,
-        wandb_enabled=False,
-    ),
-    TrainConfig(
-        name="debug_restore",
-        data=FakeDataConfig(),
-        batch_size=2,
-        model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
-        weight_loader=weight_loaders.CheckpointWeightLoader("./checkpoints/debug/debug/9/params"),
-        overwrite=True,
-        exp_name="debug",
-        num_train_steps=10,
-        wandb_enabled=False,
-    ),
-    TrainConfig(
-        name="debug_pi05",
-        model=pi0_config.Pi0Config(pi05=True, paligemma_variant="dummy", action_expert_variant="dummy"),
-        data=FakeDataConfig(),
-        batch_size=2,
-        num_train_steps=10,
-        overwrite=True,
-        exp_name="debug_pi05",
-        wandb_enabled=False,
-    ),
-    # RoboArena & PolaRiS configs.
-    *roboarena_config.get_roboarena_configs(),
-    *polaris_config.get_polaris_configs(),
 ]
+
+
+def _g31c_train_only_filter(*patterns: str) -> Filter:
+    """Freeze every parameter except paths matched by one of the recipe patterns."""
+    return nnx.Not(nnx.Any(*(nnx_utils.PathRegex(pattern) for pattern in patterns)))
+
+
+def _g31c_policy_metadata(recipe: str) -> dict[str, Any]:
+    return {
+        "task_info": {
+            "benchmark": "RoboTwin-2.0",
+            "task": "adjust_bottle",
+            "task_config": "demo_clean",
+            "scene": "Easy",
+        },
+        "robot_config": {
+            "embodiment": "aloha-agilex",
+            "action_type": "joint",
+            "state_action_dim": 14,
+        },
+        "input_config": {
+            "cameras": ["head", "left_wrist", "right_wrist"],
+            "language_instruction": True,
+        },
+        "training_purpose": {
+            "stage": "G3.1c",
+            "type": "trainable-set-recipe",
+            "selection_axis": "trainable-set",
+        },
+        "recipe": recipe,
+    }
+
+
+def _g31c_recipe_configs(base: TrainConfig) -> list[TrainConfig]:
+    """Register the four π0.5 trainable-set recipes used by manip G3.1c."""
+    interface = r"(?:action_in_proj|action_out_proj|time_mlp_in|time_mlp_out)/.*"
+    lora = r".*lora.*"
+    action_expert = r".*llm.*_1.*"
+
+    strict_model = dataclasses.replace(
+        base.model,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m_lora",
+    )
+    expert_model = dataclasses.replace(
+        base.model,
+        paligemma_variant="gemma_2b",
+        action_expert_variant="gemma_300m",
+    )
+    dual_lora_model = strict_model
+    hybrid_model = dataclasses.replace(
+        base.model,
+        paligemma_variant="gemma_2b_lora",
+        action_expert_variant="gemma_300m",
+    )
+    common = {"ema_decay": None, "fsdp_devices": 1}
+    return [
+        dataclasses.replace(
+            base,
+            name="pi05_g31c_strict_dual_lora_interface",
+            model=strict_model,
+            freeze_filter=_g31c_train_only_filter(lora, interface),
+            policy_metadata=_g31c_policy_metadata("strict-dual-lora-interface"),
+            **common,
+        ),
+        dataclasses.replace(
+            base,
+            name="pi05_g31c_action_expert_interface",
+            model=expert_model,
+            freeze_filter=_g31c_train_only_filter(action_expert, interface),
+            policy_metadata=_g31c_policy_metadata("action-expert-interface"),
+            **common,
+        ),
+        dataclasses.replace(
+            base,
+            name="pi05_g31c_builtin_dual_lora",
+            model=dual_lora_model,
+            freeze_filter=dual_lora_model.get_freeze_filter(),
+            policy_metadata=_g31c_policy_metadata("builtin-dual-lora"),
+            **common,
+        ),
+        dataclasses.replace(
+            base,
+            name="pi05_g31c_vlm_lora_expert_full",
+            model=hybrid_model,
+            freeze_filter=hybrid_model.get_freeze_filter(),
+            policy_metadata=_g31c_policy_metadata("vlm-lora-expert-full"),
+            **common,
+        ),
+    ]
+
+
+_CONFIGS.extend(_g31c_recipe_configs(_CONFIGS[0]))
+
+
+def _g33_policy_metadata(task: str, recipe: str) -> dict[str, Any]:
+    return {
+        "task_info": {
+            "benchmark": "RoboTwin-2.0",
+            "task": task,
+            "task_config": "demo_clean",
+            "scene": "Easy",
+        },
+        "robot_config": {
+            "embodiment": "aloha-agilex",
+            "action_type": "joint",
+            "state_action_dim": 14,
+        },
+        "input_config": {
+            "cameras": ["head", "left_wrist", "right_wrist"],
+            "language_instruction": True,
+        },
+        "training_purpose": {
+            "stage": "G3.3",
+            "type": "cross-task-start-factorial",
+            "comparison_axes": ["recipe", "start"],
+            "training_seed": 0,
+        },
+        "recipe": recipe,
+    }
+
+
+def _g33_recipe_configs(base: TrainConfig) -> list[TrainConfig]:
+    """Register matching built-in/hybrid configs for both G3.3 tasks."""
+    templates = {
+        config.policy_metadata["recipe"]: config
+        for config in _g31c_recipe_configs(base)
+        if config.policy_metadata is not None
+        and config.policy_metadata["recipe"] in {"builtin-dual-lora", "vlm-lora-expert-full"}
+    }
+    configs = []
+    for task in ("lift_pot", "handover_block"):
+        for recipe, template in templates.items():
+            recipe_name = recipe.replace("-", "_")
+            configs.append(
+                dataclasses.replace(
+                    template,
+                    name=f"pi05_g33_{task}_{recipe_name}",
+                    policy_metadata=_g33_policy_metadata(task, recipe),
+                )
+            )
+    return configs
+
+
+_CONFIGS.extend(_g33_recipe_configs(_CONFIGS[0]))
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")

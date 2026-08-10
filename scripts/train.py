@@ -1,7 +1,11 @@
 import dataclasses
 import functools
+import json
 import logging
+import os
+from pathlib import Path
 import platform
+import time
 from typing import Any
 
 import etils.epath as epath
@@ -47,6 +51,73 @@ def init_logging():
     logger.handlers[0].setFormatter(formatter)
 
 
+def _append_jsonl(path: Path | None, value: dict[str, Any]) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(value, sort_keys=True) + "\n")
+
+
+def _nominal_dataset_size() -> int | None:
+    value = os.environ.get("OPENPI_NOMINAL_DATASET_SIZE")
+    if value is None:
+        return None
+    size = int(value)
+    if size <= 0:
+        raise ValueError("OPENPI_NOMINAL_DATASET_SIZE must be positive")
+    return size
+
+
+def _tracking_metadata() -> dict[str, Any] | None:
+    value = os.environ.get("OPENPI_TRACKING_METADATA_JSON")
+    if value is None:
+        return None
+    metadata = json.loads(value)
+    if not isinstance(metadata, dict):
+        raise ValueError("OPENPI_TRACKING_METADATA_JSON must encode an object")
+    return metadata
+
+
+def wandb_config_overrides() -> dict[str, Any]:
+    overrides: dict[str, Any] = {}
+    if dataset_size := _nominal_dataset_size():
+        overrides["nominal_dataset_size"] = dataset_size
+    if metadata := _tracking_metadata():
+        overrides["run_metadata"] = metadata
+    return overrides
+
+
+def progress_metrics(
+    *,
+    step: int,
+    start_step: int,
+    num_train_steps: int,
+    batch_size: int,
+    elapsed_seconds: float,
+    interval_updates: int,
+    learning_rate: float,
+) -> dict[str, float | int]:
+    if interval_updates <= 0:
+        raise ValueError("interval_updates must be positive")
+    elapsed_seconds = max(elapsed_seconds, 1e-12)
+    completed_updates = step + 1
+    step_time = elapsed_seconds / interval_updates
+    metrics: dict[str, float | int] = {
+        "learning_rate": learning_rate,
+        "step_time_seconds": step_time,
+        "steps_per_second": interval_updates / elapsed_seconds,
+        "samples_per_second": interval_updates * batch_size / elapsed_seconds,
+        "sample_draws": completed_updates * batch_size,
+        "progress_percent": 100.0 * completed_updates / num_train_steps,
+        "eta_hours": max(num_train_steps - completed_updates, 0) * step_time / 3600.0,
+        "is_compile_interval": int(step == start_step),
+    }
+    if dataset_size := _nominal_dataset_size():
+        metrics["nominal_dataset_passes"] = completed_updates * batch_size / dataset_size
+    return metrics
+
+
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
     if not enabled:
         wandb.init(mode="disabled")
@@ -65,6 +136,9 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
             project=config.project_name,
         )
         (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+
+    if overrides := wandb_config_overrides():
+        wandb.config.update(overrides, allow_val_change=True)
 
     if log_code:
         wandb.run.log_code(epath.Path(__file__).parent.parent)
@@ -200,7 +274,8 @@ def main(config: _config.TrainConfig):
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
         )
 
-    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
+    jax_cache_dir = epath.Path(os.environ.get("JAX_COMPILATION_CACHE_DIR", "~/.cache/jax")).expanduser()
+    jax.config.update("jax_compilation_cache_dir", str(jax_cache_dir))
 
     rng = jax.random.key(config.seed)
     train_rng, init_rng = jax.random.split(rng)
@@ -215,6 +290,10 @@ def main(config: _config.TrainConfig):
         overwrite=config.overwrite,
         resume=config.resume,
     )
+    metrics_path_value = os.environ.get("OPENPI_METRICS_JSONL")
+    metrics_path = Path(metrics_path_value) if metrics_path_value else None
+    if metrics_path is not None and metrics_path.exists() and not resuming:
+        raise FileExistsError(f"metrics identity already exists: {metrics_path}")
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
     data_loader = _data_loader.create_data_loader(
@@ -256,24 +335,65 @@ def main(config: _config.TrainConfig):
     )
 
     infos = []
+    lr_schedule = config.lr_schedule.create()
+    interval_started = time.perf_counter()
+    last_requested_checkpoint: int | None = None
     for step in pbar:
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)
-        if step % config.log_interval == 0:
+        if step % config.log_interval == 0 or step == config.num_train_steps - 1:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+            now = time.perf_counter()
+            reduced_info.update(
+                progress_metrics(
+                    step=step,
+                    start_step=start_step,
+                    num_train_steps=config.num_train_steps,
+                    batch_size=config.batch_size,
+                    elapsed_seconds=now - interval_started,
+                    interval_updates=len(infos),
+                    learning_rate=float(jax.device_get(lr_schedule(step))),
+                )
+            )
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
+            serializable = {key: float(value) for key, value in reduced_info.items()}
+            serializable["step"] = step
+            _append_jsonl(metrics_path, serializable)
             infos = []
+            interval_started = now
         batch = next(data_iter)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+            save_started = time.perf_counter()
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            last_requested_checkpoint = step
+            checkpoint_info = {
+                "checkpoint_save_requested_step": step,
+                "checkpoint_save_enqueue_seconds": time.perf_counter() - save_started,
+            }
+            wandb.log(checkpoint_info, step=step)
+            logging.info(
+                "Checkpoint save requested: step=%d enqueue_seconds=%.3f",
+                step,
+                checkpoint_info["checkpoint_save_enqueue_seconds"],
+            )
 
     logging.info("Waiting for checkpoint manager to finish")
+    checkpoint_wait_started = time.perf_counter()
     checkpoint_manager.wait_until_finished()
+    if last_requested_checkpoint is not None:
+        wandb.log(
+            {
+                "latest_complete_checkpoint_step": last_requested_checkpoint,
+                "checkpoint_final_wait_seconds": time.perf_counter() - checkpoint_wait_started,
+            },
+            step=last_requested_checkpoint,
+        )
+    wandb.finish()
 
 
 if __name__ == "__main__":
