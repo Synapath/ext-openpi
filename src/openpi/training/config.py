@@ -100,6 +100,11 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # Optional contiguous task frame counts for deterministic weighted sampling.
+    # When set, each task is sampled with p_i proportional to n_i**task_sampling_exponent.
+    task_frame_counts: Sequence[int] = ()
+    task_sampling_exponent: float | None = None
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -915,6 +920,67 @@ def _g33_recipe_configs(base: TrainConfig) -> list[TrainConfig]:
 
 
 _CONFIGS.extend(_g33_recipe_configs(_CONFIGS[0]))
+
+
+def _g34_policy_metadata() -> dict[str, Any]:
+    return {
+        "task_info": {
+            "benchmark": "RoboTwin-2.0",
+            "tasks": ["adjust_bottle", "lift_pot", "pick_dual_bottles", "handover_block"],
+            "task_config": "demo_clean",
+            "scene": "Easy",
+        },
+        "robot_config": {
+            "embodiment": "aloha-agilex",
+            "action_type": "joint",
+            "state_action_dim": 14,
+        },
+        "input_config": {
+            "cameras": ["head", "left_wrist", "right_wrist"],
+            "language_instruction": True,
+            "canonical_task_id_model_input": False,
+        },
+        "training_purpose": {
+            "stage": "G3.4",
+            "type": "four-task-joint-training",
+            "training_seed": 0,
+            "sampling_rule": "p_i_proportional_to_n_i_power_0.43",
+        },
+        "recipe": "builtin-dual-lora",
+    }
+
+
+def _g34_recipe_config(base: TrainConfig) -> TrainConfig:
+    """Register the frozen four-task G3.4 joint recipe."""
+    template = next(
+        config
+        for config in _g31c_recipe_configs(base)
+        if config.policy_metadata is not None and config.policy_metadata["recipe"] == "builtin-dual-lora"
+    )
+    assert isinstance(template.data, LeRobotAlohaDataConfig)
+    joint_repo_id = "RoboTwin-g34-joint4-aloha_agilex-joint"
+    return dataclasses.replace(
+        template,
+        name="pi05_g34_joint4_builtin_dual_lora",
+        data=dataclasses.replace(
+            template.data,
+            repo_id=joint_repo_id,
+            assets=AssetsConfig(asset_id=joint_repo_id),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                task_frame_counts=(7188, 5554, 6129, 14084),
+                task_sampling_exponent=0.43,
+            ),
+        ),
+        policy_metadata=_g34_policy_metadata(),
+        batch_size=32,
+        seed=0,
+        ema_decay=None,
+        fsdp_devices=1,
+    )
+
+
+_CONFIGS.append(_g34_recipe_config(_CONFIGS[0]))
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")

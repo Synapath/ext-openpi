@@ -1,0 +1,36 @@
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from scripts import build_g34_joint_dataset as builder
+
+
+def test_choose_instruction_is_episode_deterministic() -> None:
+    values = np.asarray([b"first", b"second"])
+
+    assert builder.choose_instruction(values, 0) == "first"
+    assert builder.choose_instruction(values, 3) == "second"
+
+
+def test_next_state_actions() -> None:
+    state = np.arange(42, dtype=np.float32).reshape(3, 14)
+
+    observed = builder.next_state_actions(state)
+
+    np.testing.assert_array_equal(observed[0], state[1])
+    np.testing.assert_array_equal(observed[1], state[2])
+    np.testing.assert_array_equal(observed[2], state[2])
+
+
+def test_tree_sha256_depends_on_paths_and_contents(tmp_path: Path) -> None:
+    (tmp_path / "a").write_bytes(b"value")
+    first = builder.tree_sha256(tmp_path)
+    (tmp_path / "a").rename(tmp_path / "b")
+
+    assert builder.tree_sha256(tmp_path) != first
+
+
+def test_source_files_requires_frozen_episode_count(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="Expected 50"):
+        builder.source_files(tmp_path, "adjust_bottle")

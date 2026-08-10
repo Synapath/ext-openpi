@@ -313,6 +313,15 @@ def create_torch_data_loader(
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size
     # For JAX, divide by process count
     sampler = None
+    if data_config.task_frame_counts:
+        if framework == "pytorch" and torch.distributed.is_initialized():
+            raise NotImplementedError("Weighted task sampling is not supported with PyTorch DDP.")
+        sampler = create_weighted_task_sampler(
+            data_config.task_frame_counts,
+            data_config.task_sampling_exponent,
+            dataset_size=len(dataset),
+            seed=seed,
+        )
     if framework == "pytorch":
         if torch.distributed.is_initialized():
             sampler = torch.utils.data.distributed.DistributedSampler(
@@ -342,6 +351,40 @@ def create_torch_data_loader(
     )
 
     return DataLoaderImpl(data_config, data_loader)
+
+
+def task_sampling_probabilities(frame_counts: Sequence[int], exponent: float | None) -> np.ndarray:
+    """Return full-precision task probabilities p_i proportional to n_i**exponent."""
+    counts = np.asarray(frame_counts, dtype=np.int64)
+    if counts.ndim != 1 or len(counts) == 0 or np.any(counts <= 0):
+        raise ValueError(f"Task frame counts must be a non-empty positive vector, got {frame_counts!r}.")
+    if exponent is None or not np.isfinite(exponent):
+        raise ValueError(f"A finite task sampling exponent is required, got {exponent!r}.")
+    powers = counts.astype(np.float64) ** exponent
+    return powers / powers.sum()
+
+
+def create_weighted_task_sampler(
+    frame_counts: Sequence[int],
+    exponent: float | None,
+    *,
+    dataset_size: int,
+    seed: int,
+) -> torch.utils.data.WeightedRandomSampler:
+    """Sample frames with replacement while enforcing task-level probabilities."""
+    counts = np.asarray(frame_counts, dtype=np.int64)
+    if int(counts.sum()) != dataset_size:
+        raise ValueError(f"Task frame counts sum to {int(counts.sum())}, but dataset has {dataset_size} rows.")
+    probabilities = task_sampling_probabilities(counts, exponent)
+    frame_weights = np.repeat(probabilities / counts, counts)
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return torch.utils.data.WeightedRandomSampler(
+        torch.as_tensor(frame_weights, dtype=torch.double),
+        num_samples=dataset_size,
+        replacement=True,
+        generator=generator,
+    )
 
 
 def create_rlds_data_loader(
