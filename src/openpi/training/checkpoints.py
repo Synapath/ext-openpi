@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Collection
 import concurrent.futures as futures
 import dataclasses
 import logging
@@ -18,7 +19,12 @@ import openpi.training.utils as training_utils
 
 
 def initialize_checkpoint_dir(
-    checkpoint_dir: epath.Path | str, *, keep_period: int | None, overwrite: bool, resume: bool
+    checkpoint_dir: epath.Path | str,
+    *,
+    keep_period: int | None,
+    overwrite: bool,
+    resume: bool,
+    checkpoint_steps: Collection[int] | None = None,
 ) -> tuple[ocp.CheckpointManager, bool]:
     checkpoint_dir = epath.Path(checkpoint_dir).resolve()
     resuming = False
@@ -37,6 +43,10 @@ def initialize_checkpoint_dir(
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    # Exact save steps are zero-based and may not align with a periodic retention rule.
+    max_to_keep = len(checkpoint_steps) if checkpoint_steps is not None else 1
+    retention_period = None if checkpoint_steps is not None else keep_period
+
     mngr = ocp.CheckpointManager(
         checkpoint_dir,
         item_handlers={
@@ -45,8 +55,8 @@ def initialize_checkpoint_dir(
             "params": ocp.PyTreeCheckpointHandler(),
         },
         options=ocp.CheckpointManagerOptions(
-            max_to_keep=1,
-            keep_period=keep_period,
+            max_to_keep=max_to_keep,
+            keep_period=retention_period,
             create=False,
             async_options=ocp.AsyncOptions(timeout_secs=7200),
         ),

@@ -299,11 +299,13 @@ def main(config: _config.TrainConfig):
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
+    requested_checkpoint_steps = _requested_checkpoint_steps(config.num_train_steps)
     checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
         config.checkpoint_dir,
         keep_period=config.keep_period,
         overwrite=config.overwrite,
         resume=config.resume,
+        checkpoint_steps=requested_checkpoint_steps,
     )
     metrics_path_value = os.environ.get("OPENPI_METRICS_JSONL")
     metrics_path = Path(metrics_path_value) if metrics_path_value else None
@@ -353,7 +355,6 @@ def main(config: _config.TrainConfig):
     lr_schedule = config.lr_schedule.create()
     interval_started = time.perf_counter()
     last_requested_checkpoint: int | None = None
-    requested_checkpoint_steps = _requested_checkpoint_steps(config.num_train_steps)
     for step in pbar:
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)

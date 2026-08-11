@@ -1,0 +1,17 @@
+from openpi.training import checkpoints
+
+
+def test_requested_checkpoint_steps_override_periodic_retention(tmp_path):
+    manager, resuming = checkpoints.initialize_checkpoint_dir(
+        tmp_path / "checkpoints",
+        keep_period=5,
+        overwrite=False,
+        resume=False,
+        checkpoint_steps={4, 9},
+    )
+    try:
+        assert not resuming
+        assert manager._options.max_to_keep == 2  # noqa: SLF001
+        assert manager._options.keep_period is None  # noqa: SLF001
+    finally:
+        manager.close()
