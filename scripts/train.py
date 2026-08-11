@@ -69,6 +69,21 @@ def _nominal_dataset_size() -> int | None:
     return size
 
 
+def _requested_checkpoint_steps(num_train_steps: int) -> frozenset[int] | None:
+    value = os.environ.get("OPENPI_CHECKPOINT_STEPS")
+    if value is None:
+        return None
+    try:
+        steps = [int(item) for item in value.split(",")]
+    except ValueError as exc:
+        raise ValueError("OPENPI_CHECKPOINT_STEPS must be comma-separated integers") from exc
+    if not steps or steps != sorted(set(steps)):
+        raise ValueError("OPENPI_CHECKPOINT_STEPS must be non-empty, sorted, and unique")
+    if steps[0] < 0 or steps[-1] != num_train_steps - 1:
+        raise ValueError("OPENPI_CHECKPOINT_STEPS must be non-negative and end at the final step")
+    return frozenset(steps)
+
+
 def _tracking_metadata() -> dict[str, Any] | None:
     value = os.environ.get("OPENPI_TRACKING_METADATA_JSON")
     if value is None:
@@ -338,6 +353,7 @@ def main(config: _config.TrainConfig):
     lr_schedule = config.lr_schedule.create()
     interval_started = time.perf_counter()
     last_requested_checkpoint: int | None = None
+    requested_checkpoint_steps = _requested_checkpoint_steps(config.num_train_steps)
     for step in pbar:
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
@@ -367,7 +383,9 @@ def main(config: _config.TrainConfig):
             interval_started = now
         batch = next(data_iter)
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+        default_save = (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1
+        should_save = step in requested_checkpoint_steps if requested_checkpoint_steps is not None else default_save
+        if should_save:
             save_started = time.perf_counter()
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
             last_requested_checkpoint = step

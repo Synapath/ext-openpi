@@ -44,6 +44,20 @@ def test_tracking_metadata(monkeypatch: pytest.MonkeyPatch):
     }
 
 
+def test_requested_checkpoint_steps(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("OPENPI_CHECKPOINT_STEPS", raising=False)
+    assert train._requested_checkpoint_steps(10) is None  # noqa: SLF001
+    monkeypatch.setenv("OPENPI_CHECKPOINT_STEPS", "4,9")
+    assert train._requested_checkpoint_steps(10) == frozenset({4, 9})  # noqa: SLF001
+
+
+@pytest.mark.parametrize("value", ["", "4,4,9", "9,4", "4,8", "x,9", "-1,9"])
+def test_requested_checkpoint_steps_rejects_invalid(monkeypatch: pytest.MonkeyPatch, value: str):
+    monkeypatch.setenv("OPENPI_CHECKPOINT_STEPS", value)
+    with pytest.raises(ValueError, match="OPENPI_CHECKPOINT_STEPS"):
+        train._requested_checkpoint_steps(10)  # noqa: SLF001
+
+
 def test_append_jsonl(tmp_path: pathlib.Path):
     output = tmp_path / "metrics.jsonl"
     train._append_jsonl(output, {"step": 0, "loss": 0.5})  # noqa: SLF001

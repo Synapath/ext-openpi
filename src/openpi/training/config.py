@@ -980,7 +980,38 @@ def _g34_recipe_config(base: TrainConfig) -> TrainConfig:
     )
 
 
-_CONFIGS.append(_g34_recipe_config(_CONFIGS[0]))
+def _g34_pick_dual_bottles_config(base: TrainConfig) -> TrainConfig:
+    """Register the matched single-task comparator for G3.4."""
+    template = next(
+        config
+        for config in _g31c_recipe_configs(base)
+        if config.policy_metadata is not None and config.policy_metadata["recipe"] == "builtin-dual-lora"
+    )
+    assert isinstance(template.data, LeRobotAlohaDataConfig)
+    repo_id = "RoboTwin-pick_dual_bottles-aloha_agilex-joint"
+    metadata = _g33_policy_metadata("pick_dual_bottles", "builtin-dual-lora")
+    metadata["training_purpose"] = {
+        "stage": "G3.4",
+        "type": "matched-single-task-comparator",
+        "training_seed": 0,
+    }
+    return dataclasses.replace(
+        template,
+        name="pi05_g34_pick_dual_bottles_builtin_dual_lora",
+        data=dataclasses.replace(
+            template.data,
+            repo_id=repo_id,
+            assets=AssetsConfig(asset_id=repo_id),
+        ),
+        policy_metadata=metadata,
+        batch_size=32,
+        seed=0,
+        ema_decay=None,
+        fsdp_devices=1,
+    )
+
+
+_CONFIGS.extend([_g34_recipe_config(_CONFIGS[0]), _g34_pick_dual_bottles_config(_CONFIGS[0])])
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")

@@ -24,3 +24,19 @@ def test_g34_joint_recipe_contract() -> None:
     assert config.policy_metadata is not None
     assert config.policy_metadata["recipe"] == "builtin-dual-lora"
     assert config.policy_metadata["training_purpose"]["stage"] == "G3.4"
+
+
+def test_g34_pick_dual_bottles_recipe_contract() -> None:
+    config = config_module.get_config("pi05_g34_pick_dual_bottles_builtin_dual_lora")
+    data_config = config.data.create(config.assets_dirs, config.model)
+
+    assert config.batch_size == 32
+    assert config.seed == 0
+    assert config.ema_decay is None
+    assert data_config.repo_id == "RoboTwin-pick_dual_bottles-aloha_agilex-joint"
+    assert tuple(data_config.task_frame_counts) == ()
+    assert data_config.task_sampling_exponent is None
+    assert config.policy_metadata is not None
+    assert config.policy_metadata["task_info"]["task"] == "pick_dual_bottles"
+    assert config.policy_metadata["recipe"] == "builtin-dual-lora"
+    assert config.policy_metadata["training_purpose"]["type"] == "matched-single-task-comparator"
