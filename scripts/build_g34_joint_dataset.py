@@ -65,6 +65,31 @@ def tree_sha256(root: Path) -> str:
     return digest.hexdigest()
 
 
+def tree_inventory(root: Path) -> list[tuple[str, int, int]]:
+    """Relative path, size and mtime_ns for every regular file below root."""
+    return [
+        (path.relative_to(root).as_posix(), path.stat().st_size, path.stat().st_mtime_ns)
+        for path in sorted(item for item in root.rglob("*") if item.is_file())
+    ]
+
+
+def stable_tree_sha256(root: Path) -> str:
+    """Hash the tree and prove nothing wrote to it while hashing.
+
+    LeRobot only writes parquet footers and episode metadata when its writers are
+    closed, so hashing a still-open dataset yields a digest of a partially written
+    tree. Callers must close the dataset first; this guard turns any remaining
+    write race into a hard failure instead of an unreproducible digest.
+    """
+    before = tree_inventory(root)
+    digest = tree_sha256(root)
+    after = tree_inventory(root)
+    if before != after:
+        changed = sorted({entry[0] for entry in set(before) ^ set(after)})
+        raise RuntimeError(f"Dataset tree changed while hashing; digest is not reproducible: {changed}")
+    return digest
+
+
 def choose_instruction(raw: Any, episode_index: int) -> str:
     """Choose one original prompt deterministically for the whole source episode."""
     instructions = list(raw)
@@ -217,6 +242,11 @@ def main() -> None:
             raise ValueError(f"Frame count mismatch for {task_id}: expected {expected_frames}, observed {task_frames}.")
         task_totals[task_id] = task_frames
 
+    # Close the parquet writers so footers and episode metadata land on disk before
+    # anything reads or hashes the tree. Without this the dataset is only completed
+    # incidentally at interpreter shutdown, after the manifest has been written.
+    dataset.finalize()
+
     info_path = output_root / "meta" / "info.json"
     info = json.loads(info_path.read_text())
     if info["total_episodes"] != 200 or info["total_frames"] != sum(count for _, count in TASKS):
@@ -226,7 +256,7 @@ def main() -> None:
         "status": "PASS",
         "repo_id": args.repo_id,
         "dataset_root": str(output_root.resolve()),
-        "dataset_tree_sha256": tree_sha256(output_root),
+        "dataset_tree_sha256": stable_tree_sha256(output_root),
         "info_sha256": sha256_file(info_path),
         "fps": 50,
         "camera_order": list(CAMERAS.values()),
