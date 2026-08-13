@@ -1013,6 +1013,102 @@ def _g34_pick_dual_bottles_config(base: TrainConfig) -> TrainConfig:
 
 _CONFIGS.extend([_g34_recipe_config(_CONFIGS[0]), _g34_pick_dual_bottles_config(_CONFIGS[0])])
 
+
+_G4_J10_TASKS = (
+    "grab_roller",
+    "adjust_bottle",
+    "lift_pot",
+    "dump_bin_bigbin",
+    "click_alarmclock",
+    "pick_dual_bottles",
+    "handover_block",
+    "beat_block_hammer",
+    "place_a2b_left",
+    "place_a2b_right",
+)
+
+
+def _g4_j10_policy_metadata(distribution: str) -> dict[str, Any]:
+    return {
+        "task_info": {
+            "benchmark": "RoboTwin-2.0",
+            "tasks": list(_G4_J10_TASKS),
+            "environment_distribution": distribution,
+        },
+        "robot_config": {
+            "embodiment": "aloha-agilex",
+            "action_type": "joint",
+            "state_action_dim": 14,
+        },
+        "input_config": {
+            "cameras": ["head", "left_wrist", "right_wrist"],
+            "language_instruction": True,
+            "canonical_task_id_model_input": False,
+        },
+        "training_purpose": {
+            "stage": "G4.2",
+            "type": "matched-joint10-training",
+            "controlled_axis": "environment_distribution",
+            "training_seed": 0,
+            "sampling_rule": "p_i_proportional_to_n_i_power_0.43",
+        },
+        "recipe": "builtin-dual-lora",
+    }
+
+
+def _g4_j10_recipe_configs(base: TrainConfig) -> list[TrainConfig]:
+    """Register the matched clean/mixed Joint10 G4.2 recipes."""
+    template = next(
+        config
+        for config in _g31c_recipe_configs(base)
+        if config.policy_metadata is not None and config.policy_metadata["recipe"] == "builtin-dual-lora"
+    )
+    assert isinstance(template.data, LeRobotAlohaDataConfig)
+    variants = {
+        "clean": (
+            "RoboTwin-g4-j10-clean-aloha_agilex-joint",
+            (4728, 7188, 5554, 12122, 4252, 6129, 14084, 5682, 7451, 7349),
+        ),
+        "mixed": (
+            "RoboTwin-g4-j10-mixed-aloha_agilex-joint",
+            (4820, 7412, 5709, 13462, 4258, 6320, 14571, 6038, 7712, 7683),
+        ),
+    }
+    configs = []
+    for distribution, (repo_id, frame_counts) in variants.items():
+        configs.append(
+            dataclasses.replace(
+                template,
+                name=f"pi05_g4_j10_{distribution}_builtin_dual_lora",
+                data=dataclasses.replace(
+                    template.data,
+                    repo_id=repo_id,
+                    assets=AssetsConfig(asset_id=repo_id),
+                    base_config=DataConfig(
+                        prompt_from_task=True,
+                        task_frame_counts=frame_counts,
+                        task_sampling_exponent=0.43,
+                    ),
+                ),
+                policy_metadata=_g4_j10_policy_metadata(distribution),
+                batch_size=32,
+                seed=0,
+                ema_decay=None,
+                fsdp_devices=1,
+                num_train_steps=35_748,
+                lr_schedule=_optimizer.CosineDecaySchedule(
+                    warmup_steps=1_000,
+                    peak_lr=2.5e-5,
+                    decay_steps=35_748,
+                    decay_lr=2.5e-6,
+                ),
+            )
+        )
+    return configs
+
+
+_CONFIGS.extend(_g4_j10_recipe_configs(_CONFIGS[0]))
+
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}
