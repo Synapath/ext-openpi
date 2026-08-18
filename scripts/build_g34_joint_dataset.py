@@ -104,6 +104,25 @@ def choose_instruction(raw: Any, episode_index: int) -> str:
     return prompt
 
 
+def read_instructions(dataset: h5py.Dataset) -> list[Any]:
+    """Read both legacy instruction arrays and scalar JSON instruction lists."""
+    raw = dataset[()]
+    if isinstance(raw, bytes | np.bytes_):
+        text = bytes(raw).rstrip(b"\0").decode("utf-8")
+        try:
+            decoded = json.loads(text)
+        except json.JSONDecodeError:
+            return [text]
+        if isinstance(decoded, list):
+            return decoded
+        if isinstance(decoded, str):
+            return [decoded]
+        raise ValueError(f"Scalar instructions JSON must decode to a string or list, got {type(decoded).__name__}.")
+    if isinstance(raw, np.ndarray):
+        return raw.tolist()
+    return [raw]
+
+
 def decode_images(encoded: Any) -> np.ndarray:
     frames = []
     for index, value in enumerate(encoded):
@@ -138,7 +157,8 @@ def load_episode(path: Path, local_episode_index: int) -> dict[str, Any]:
         )
         state = np.concatenate([left, right], axis=1).astype(np.float32)
         images = {output: decode_images(episode[f"vision/{source}/colors"][:]) for source, output in CAMERAS.items()}
-        prompt = choose_instruction(episode["instructions"][:], local_episode_index)
+        instruction_key = "instructions" if "instructions" in episode else "instruction"
+        prompt = choose_instruction(read_instructions(episode[instruction_key]), local_episode_index)
     if any(len(value) != len(state) for value in images.values()):
         raise ValueError(f"Camera/state length mismatch in {path}.")
     return {"state": state, "action": next_state_actions(state), "images": images, "prompt": prompt}

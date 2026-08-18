@@ -13,6 +13,24 @@ def test_choose_instruction_is_episode_deterministic() -> None:
     assert builder.choose_instruction(values, 3) == "second"
 
 
+def test_read_instructions_accepts_scalar_json_and_legacy_array(tmp_path) -> None:
+    import h5py
+    import numpy as np
+
+    path = tmp_path / "instructions.hdf5"
+    with h5py.File(path, "w") as episode:
+        scalar = episode.create_dataset(
+            "scalar",
+            data=np.bytes_('["first", "second"]'),
+        )
+        legacy = episode.create_dataset(
+            "legacy",
+            data=np.asarray([b"first", b"second"]),
+        )
+        assert builder.read_instructions(scalar) == ["first", "second"]
+        assert builder.read_instructions(legacy) == [b"first", b"second"]
+
+
 def test_next_state_actions() -> None:
     state = np.arange(42, dtype=np.float32).reshape(3, 14)
 
