@@ -251,6 +251,9 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     # the space used by the pi internal runtime which was used to train the base model. People who
     # use standard Aloha data should set this to true.
     adapt_to_pi: bool = False
+    # Physical camera streams exposed to the policy. The source dataset may
+    # retain all streams so paired camera conditions share identical records.
+    enabled_cameras: tuple[str, ...] = ("cam_high", "cam_left_wrist", "cam_right_wrist")
 
     # Repack transforms.
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
@@ -272,7 +275,12 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         data_transforms = _transforms.Group(
-            inputs=[aloha_policy.AlohaInputs(adapt_to_pi=self.adapt_to_pi)],
+            inputs=[
+                aloha_policy.AlohaInputs(
+                    adapt_to_pi=self.adapt_to_pi,
+                    enabled_cameras=self.enabled_cameras,
+                )
+            ],
             outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi)],
         )
         if self.use_delta_joint_actions:

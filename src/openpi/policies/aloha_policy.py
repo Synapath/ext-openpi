@@ -41,6 +41,11 @@ class AlohaInputs(transforms.DataTransformFn):
     # the space used by the pi internal runtime which was used to train the base model.
     adapt_to_pi: bool = True
 
+    # Keep the model input tree static while controlling which physical cameras
+    # are visible to the policy. Disabled wrist cameras are replaced with black
+    # images and marked invalid, exactly like cameras absent at inference time.
+    enabled_cameras: tuple[str, ...] = ("cam_high", "cam_left_wrist", "cam_right_wrist")
+
     # The expected cameras names. All input cameras must be in this set. Missing cameras will be
     # replaced with black images and the corresponding `image_mask` will be set to False.
     EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = ("cam_high", "cam_low", "cam_left_wrist", "cam_right_wrist")
@@ -51,6 +56,10 @@ class AlohaInputs(transforms.DataTransformFn):
         in_images = data["images"]
         if set(in_images) - set(self.EXPECTED_CAMERAS):
             raise ValueError(f"Expected images to contain {self.EXPECTED_CAMERAS}, got {tuple(in_images)}")
+        if "cam_high" not in self.enabled_cameras:
+            raise ValueError("cam_high must remain enabled for Aloha inputs")
+        if set(self.enabled_cameras) - set(self.EXPECTED_CAMERAS):
+            raise ValueError(f"Unsupported enabled cameras: {self.enabled_cameras}")
 
         # Assume that base image always exists.
         base_image = in_images["cam_high"]
@@ -68,7 +77,7 @@ class AlohaInputs(transforms.DataTransformFn):
             "right_wrist_0_rgb": "cam_right_wrist",
         }
         for dest, source in extra_image_names.items():
-            if source in in_images:
+            if source in in_images and source in self.enabled_cameras:
                 images[dest] = in_images[source]
                 image_masks[dest] = _make_image_mask(in_images[source], True)
             else:
