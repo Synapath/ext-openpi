@@ -1117,6 +1117,101 @@ def _g4_j10_recipe_configs(base: TrainConfig) -> list[TrainConfig]:
 
 _CONFIGS.extend(_g4_j10_recipe_configs(_CONFIGS[0]))
 
+
+_G51_TASKS = (
+    "place_empty_cup",
+    "place_container_plate",
+    "press_stapler",
+    "turn_switch",
+    "adjust_bottle",
+)
+_G51_FRAME_COUNTS = (9133, 8398, 5990, 4892, 7188)
+
+
+def _g51_policy_metadata(camera_condition: str, seed: int) -> dict[str, Any]:
+    cameras = ["head"] if camera_condition == "head_only" else ["head", "left_wrist", "right_wrist"]
+    return {
+        "task_info": {
+            "benchmark": "RoboTwin-2.0",
+            "tasks": list(_G51_TASKS),
+            "task_config": "demo_clean",
+            "scene": "Easy",
+        },
+        "robot_config": {
+            "embodiment": "aloha-agilex",
+            "action_type": "joint",
+            "state_action_dim": 14,
+        },
+        "input_config": {
+            "camera_condition": camera_condition,
+            "cameras": cameras,
+            "language_instruction": True,
+            "canonical_task_id_model_input": False,
+        },
+        "training_purpose": {
+            "stage": "G5.1",
+            "type": "matched-camera-adaptation",
+            "controlled_axis": "camera_inputs",
+            "training_seed": seed,
+            "sampling_rule": "uniform-task-p-0.2",
+            "reference_passes": 10,
+        },
+        "recipe": "builtin-dual-lora",
+    }
+
+
+def _g51_recipe_configs(base: TrainConfig) -> list[TrainConfig]:
+    """Register the four matched G5.1 camera-condition/seed recipes."""
+    template = next(
+        config
+        for config in _g31c_recipe_configs(base)
+        if config.policy_metadata is not None and config.policy_metadata["recipe"] == "builtin-dual-lora"
+    )
+    assert isinstance(template.data, LeRobotAlohaDataConfig)
+    repo_id = "RoboTwin-g51-easy5-clean-aloha_agilex-joint"
+    cameras = {
+        "head_only": ("cam_high",),
+        "three_view": ("cam_high", "cam_left_wrist", "cam_right_wrist"),
+    }
+    configs = []
+    for camera_condition, enabled_cameras in cameras.items():
+        configs.extend(
+            (
+                dataclasses.replace(
+                    template,
+                    name=f"pi05_g51_easy5_{camera_condition}_s{seed}_builtin_dual_lora",
+                    data=dataclasses.replace(
+                        template.data,
+                        repo_id=repo_id,
+                        assets=AssetsConfig(asset_id=repo_id),
+                        base_config=DataConfig(
+                            prompt_from_task=True,
+                            task_frame_counts=_G51_FRAME_COUNTS,
+                            task_sampling_exponent=0.0,
+                        ),
+                        enabled_cameras=enabled_cameras,
+                    ),
+                    policy_metadata=_g51_policy_metadata(camera_condition, seed),
+                    batch_size=32,
+                    seed=seed,
+                    ema_decay=None,
+                    fsdp_devices=1,
+                    num_train_steps=11_126,
+                    lr_schedule=_optimizer.CosineDecaySchedule(
+                        warmup_steps=311,
+                        peak_lr=2.5e-5,
+                        decay_steps=11_126,
+                        decay_lr=2.5e-6,
+                    ),
+                )
+            )
+            for seed in (0, 1)
+        )
+    return configs
+
+
+_CONFIGS.extend(_g51_recipe_configs(_CONFIGS[0]))
+
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}
