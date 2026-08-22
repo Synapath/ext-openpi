@@ -1212,6 +1212,88 @@ def _g51_recipe_configs(base: TrainConfig) -> list[TrainConfig]:
 
 _CONFIGS.extend(_g51_recipe_configs(_CONFIGS[0]))
 
+
+_G6_RBDJ_TASKS = (
+    "stack_bowls",
+    "cover_blocks",
+    "insert_tubes",
+    "fill_pen_holder",
+)
+_G6_RBDJ_FRAME_COUNTS = (18_558, 27_219, 16_144, 36_100)
+_G6_RBDJ_REPO_ID = "RoboDojo-g6-joint4-arx_x5-joint"
+
+
+def _g6_rbdj_policy_metadata() -> dict[str, Any]:
+    return {
+        "task_info": {
+            "benchmark": "RoboDojo",
+            "tasks": list(_G6_RBDJ_TASKS),
+            "held_out_eval_task": "stack_blocks_by_language",
+            "source_revision": "cfb06d1dadcdf03ccc923102b0e3f3b0a68dfc43",
+        },
+        "robot_config": {
+            "embodiment": "dual-arx-x5",
+            "action_type": "absolute-joint-gripper",
+            "state_action_dim": 14,
+            "prediction_horizon": 50,
+        },
+        "input_config": {
+            "cameras": ["head", "left_wrist", "right_wrist"],
+            "language_instruction": True,
+            "canonical_task_id_model_input": False,
+        },
+        "training_purpose": {
+            "stage": "G6",
+            "type": "robodojo-joint4-baseline",
+            "training_seed": 0,
+            "sampling_rule": "uniform-task-p-0.25",
+            "reference_passes": 10,
+            "candidate_frames": sum(_G6_RBDJ_FRAME_COUNTS),
+        },
+        "recipe": "builtin-dual-lora",
+    }
+
+
+def _g6_rbdj_recipe_config(base: TrainConfig) -> TrainConfig:
+    """Register the authorized G6 RoboDojo four-task joint recipe."""
+    template = next(
+        config
+        for config in _g31c_recipe_configs(base)
+        if config.policy_metadata is not None and config.policy_metadata["recipe"] == "builtin-dual-lora"
+    )
+    assert isinstance(template.data, LeRobotAlohaDataConfig)
+    return dataclasses.replace(
+        template,
+        name="pi05_g6_rbdj_joint4_s0_builtin_dual_lora",
+        project_name="manip-pi05-rbdj",
+        data=dataclasses.replace(
+            template.data,
+            repo_id=_G6_RBDJ_REPO_ID,
+            assets=AssetsConfig(asset_id=_G6_RBDJ_REPO_ID),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                task_frame_counts=_G6_RBDJ_FRAME_COUNTS,
+                task_sampling_exponent=0.0,
+            ),
+            enabled_cameras=("cam_high", "cam_left_wrist", "cam_right_wrist"),
+        ),
+        policy_metadata=_g6_rbdj_policy_metadata(),
+        batch_size=32,
+        seed=0,
+        ema_decay=None,
+        fsdp_devices=1,
+        num_train_steps=30_632,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=857,
+            peak_lr=2.5e-5,
+            decay_steps=30_632,
+            decay_lr=2.5e-6,
+        ),
+    )
+
+
+_CONFIGS.append(_g6_rbdj_recipe_config(_CONFIGS[0]))
+
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}
