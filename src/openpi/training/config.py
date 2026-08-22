@@ -72,6 +72,10 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Optional source episode identities to load from a LeRobot dataset. Keeping
+    # this in the frozen config prevents a local partial mirror from silently
+    # changing which episodes enter training.
+    episode_indices: Sequence[int] = ()
     # Video decoder backend for LeRobot datasets. Forced to pyav by default because
     # torchcodec is present in some environments but not fully functional at runtime.
     video_backend: Literal["pyav", "torchcodec", "video_reader"] = "pyav"
@@ -1220,6 +1224,12 @@ _G6_RBDJ_TASKS = (
     "fill_pen_holder",
 )
 _G6_RBDJ_FRAME_COUNTS = (18_558, 27_219, 16_144, 36_100)
+_G6_RBDJ_EPISODE_INDICES = (
+    *range(3_000, 3_050),  # stack_bowls
+    *range(300, 350),  # cover_blocks
+    *range(1_400, 1_450),  # insert_tubes
+    *range(800, 850),  # fill_pen_holder
+)
 _G6_RBDJ_REPO_ID = "RoboDojo-g6-joint4-arx_x5-joint"
 
 
@@ -1272,6 +1282,7 @@ def _g6_rbdj_recipe_config(base: TrainConfig) -> TrainConfig:
             assets=AssetsConfig(asset_id=_G6_RBDJ_REPO_ID),
             base_config=DataConfig(
                 prompt_from_task=True,
+                episode_indices=_G6_RBDJ_EPISODE_INDICES,
                 task_frame_counts=_G6_RBDJ_FRAME_COUNTS,
                 task_sampling_exponent=0.0,
             ),

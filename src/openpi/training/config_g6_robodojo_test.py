@@ -38,6 +38,11 @@ def test_g6_robodojo_recipe_contract() -> None:
     assert config.optimizer.clip_gradient_norm == 1.0
 
     assert data_config.repo_id == REPO_ID
+    assert len(data_config.episode_indices) == 200
+    assert tuple(data_config.episode_indices[:2]) == (3_000, 3_001)
+    assert tuple(data_config.episode_indices[48:52]) == (3_048, 3_049, 300, 301)
+    assert tuple(data_config.episode_indices[-2:]) == (848, 849)
+    assert len(set(data_config.episode_indices)) == 200
     assert tuple(data_config.task_frame_counts) == FRAME_COUNTS
     assert sum(data_config.task_frame_counts) == 98_021
     assert data_config.task_sampling_exponent == 0.0

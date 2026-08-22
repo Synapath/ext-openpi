@@ -1,10 +1,25 @@
 import dataclasses
+from unittest import mock
 
 import jax
 
 from openpi.models import pi0_config
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
+
+
+def test_create_torch_dataset_forwards_episode_indices() -> None:
+    model_config = pi0_config.Pi0Config(action_dim=14, action_horizon=50, max_token_len=48)
+    data_config = _config.DataConfig(repo_id="local-subset", episode_indices=(3, 7, 11))
+    fake_meta = mock.Mock(fps=25)
+
+    with (
+        mock.patch.object(_data_loader.lerobot_dataset, "LeRobotDatasetMetadata", return_value=fake_meta),
+        mock.patch.object(_data_loader.lerobot_dataset, "LeRobotDataset") as dataset_cls,
+    ):
+        _data_loader.create_torch_dataset(data_config, action_horizon=50, model_config=model_config)
+
+    assert dataset_cls.call_args.kwargs["episodes"] == [3, 7, 11]
 
 
 def test_torch_data_loader():
