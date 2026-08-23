@@ -48,6 +48,9 @@ def main(config: _config.TrainConfig) -> None:
     metrics_path = Path(metrics_path_value) if metrics_path_value else None
     if metrics_path is not None and metrics_path.exists():
         raise FileExistsError(f"metrics identity already exists: {metrics_path}")
+    param_norm_cadence = os.environ.get("OPENPI_CAPACITY_PARAM_NORM_CADENCE", "every-step")
+    if param_norm_cadence not in {"every-step", "production"}:
+        raise ValueError("OPENPI_CAPACITY_PARAM_NORM_CADENCE must be 'every-step' or 'production'")
 
     _train.logging.info("Capacity runner on %s; checkpoints disabled", platform.node())
     jax_cache_dir = epath.Path(os.environ.get("JAX_COMPILATION_CACHE_DIR", "~/.cache/jax")).expanduser()
@@ -94,7 +97,13 @@ def main(config: _config.TrainConfig) -> None:
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         reduced_info = jax.device_get(jax.tree.map(jnp.mean, common_utils.stack_forest([info])))
-        reduced_info["param_norm"] = jax.device_get(pparameter_norm(train_state))
+        measure_param_norm = param_norm_cadence == "every-step" or _train.should_log_step(
+            step=step,
+            num_train_steps=config.num_train_steps,
+            log_interval=config.log_interval,
+        )
+        if measure_param_norm:
+            reduced_info["param_norm"] = jax.device_get(pparameter_norm(train_state))
         reduced_info.update(
             _train.progress_metrics(
                 step=step,
@@ -108,6 +117,7 @@ def main(config: _config.TrainConfig) -> None:
         )
         serializable = {key: float(value) for key, value in reduced_info.items()}
         serializable["step"] = step
+        serializable["param_norm_measured"] = float(measure_param_norm)
         _append_jsonl(metrics_path, serializable)
         _train.logging.info("CAPACITY_METRIC %s", json.dumps(serializable, sort_keys=True))
         wandb.log(reduced_info, step=step)

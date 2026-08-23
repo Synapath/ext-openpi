@@ -35,6 +35,19 @@ def test_progress_metrics(monkeypatch: pytest.MonkeyPatch):
     }
 
 
+@pytest.mark.parametrize(
+    ("step", "expected"),
+    [(0, 1), (1, 0), (99, 0), (100, 1), (30630, 0), (30631, 1)],
+)
+def test_should_log_step(step: int, expected: int):
+    assert train.should_log_step(step=step, num_train_steps=30_632, log_interval=100) is bool(expected)
+
+
+def test_should_log_step_rejects_nonpositive_interval():
+    with pytest.raises(ValueError, match="log_interval"):
+        train.should_log_step(step=0, num_train_steps=2, log_interval=0)
+
+
 def test_tracking_metadata(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("OPENPI_TRACKING_METADATA_JSON", '{"recipe":"strict"}')
     monkeypatch.setenv("OPENPI_NOMINAL_DATASET_SIZE", "7188")

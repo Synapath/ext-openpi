@@ -134,6 +134,12 @@ def progress_metrics(
     return metrics
 
 
+def should_log_step(*, step: int, num_train_steps: int, log_interval: int) -> bool:
+    if log_interval <= 0:
+        raise ValueError("log_interval must be positive")
+    return step % log_interval == 0 or step == num_train_steps - 1
+
+
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
     if not enabled:
         wandb.init(mode="disabled")
@@ -379,7 +385,7 @@ def main(config: _config.TrainConfig):
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)
-        if step % config.log_interval == 0 or step == config.num_train_steps - 1:
+        if should_log_step(step=step, num_train_steps=config.num_train_steps, log_interval=config.log_interval):
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             reduced_info["param_norm"] = jax.device_get(pparameter_norm(train_state))
