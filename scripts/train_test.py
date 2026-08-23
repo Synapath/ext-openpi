@@ -81,6 +81,11 @@ def test_append_jsonl(tmp_path: pathlib.Path):
     ]
 
 
+def test_capacity_parameter_norm_has_single_positional_sharding():
+    source = pathlib.Path(__file__).with_name("train_capacity.py").read_text()
+    assert "in_shardings=(train_state_sharding,)" in source
+
+
 @pytest.mark.parametrize("config_name", ["debug"])
 def test_train(tmp_path: pathlib.Path, config_name: str):
     config = dataclasses.replace(

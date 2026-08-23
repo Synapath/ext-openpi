@@ -87,7 +87,7 @@ def main(config: _config.TrainConfig) -> None:
     )
     pparameter_norm = jax.jit(
         _train.parameter_norm,
-        in_shardings=train_state_sharding,
+        in_shardings=(train_state_sharding,),
         out_shardings=replicated_sharding,
     )
     lr_schedule = config.lr_schedule.create()
