@@ -365,7 +365,7 @@ def main(config: _config.TrainConfig):
     )
     pparameter_norm = jax.jit(
         parameter_norm,
-        in_shardings=train_state_sharding,
+        in_shardings=(train_state_sharding,),
         out_shardings=replicated_sharding,
     )
 

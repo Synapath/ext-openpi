@@ -86,6 +86,11 @@ def test_capacity_parameter_norm_has_single_positional_sharding():
     assert "in_shardings=(train_state_sharding,)" in source
 
 
+def test_formal_parameter_norm_has_single_positional_sharding():
+    source = pathlib.Path(__file__).with_name("train.py").read_text()
+    assert "in_shardings=(train_state_sharding,)" in source
+
+
 @pytest.mark.parametrize("config_name", ["debug"])
 def test_train(tmp_path: pathlib.Path, config_name: str):
     config = dataclasses.replace(
