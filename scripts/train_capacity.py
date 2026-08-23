@@ -82,6 +82,11 @@ def main(config: _config.TrainConfig) -> None:
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1,),
     )
+    pparameter_norm = jax.jit(
+        _train.parameter_norm,
+        in_shardings=train_state_sharding,
+        out_shardings=replicated_sharding,
+    )
     lr_schedule = config.lr_schedule.create()
 
     for step in range(config.num_train_steps):
@@ -89,6 +94,7 @@ def main(config: _config.TrainConfig) -> None:
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         reduced_info = jax.device_get(jax.tree.map(jnp.mean, common_utils.stack_forest([info])))
+        reduced_info["param_norm"] = jax.device_get(pparameter_norm(train_state))
         reduced_info.update(
             _train.progress_metrics(
                 step=step,

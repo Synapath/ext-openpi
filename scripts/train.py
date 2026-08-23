@@ -263,7 +263,16 @@ def train_step(
             ),
         )
 
-    # Filter out params that aren't kernels.
+    info = {
+        "loss": loss,
+        "grad_norm": optax.global_norm(grads),
+    }
+    return new_state, info
+
+
+def parameter_norm(state: training_utils.TrainState) -> at.Array:
+    """Compute the full kernel parameter norm for periodic monitoring."""
+    model = nnx.merge(state.model_def, state.params)
     kernel_params = nnx.state(
         model,
         nnx.All(
@@ -272,12 +281,7 @@ def train_step(
             lambda _, x: x.value.ndim > 1,
         ),
     )
-    info = {
-        "loss": loss,
-        "grad_norm": optax.global_norm(grads),
-        "param_norm": optax.global_norm(kernel_params),
-    }
-    return new_state, info
+    return optax.global_norm(kernel_params)
 
 
 def main(config: _config.TrainConfig):
@@ -342,6 +346,11 @@ def main(config: _config.TrainConfig):
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1,),
     )
+    pparameter_norm = jax.jit(
+        parameter_norm,
+        in_shardings=train_state_sharding,
+        out_shardings=replicated_sharding,
+    )
 
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
@@ -362,6 +371,7 @@ def main(config: _config.TrainConfig):
         if step % config.log_interval == 0 or step == config.num_train_steps - 1:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+            reduced_info["param_norm"] = jax.device_get(pparameter_norm(train_state))
             now = time.perf_counter()
             reduced_info.update(
                 progress_metrics(
