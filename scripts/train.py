@@ -1,3 +1,4 @@
+import concurrent.futures
 import dataclasses
 import functools
 import json
@@ -323,8 +324,25 @@ def main(config: _config.TrainConfig):
         shuffle=True,
     )
     data_iter = iter(data_loader)
-    batch = next(data_iter)
+    overlap_started = time.perf_counter()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="first-batch") as executor:
+        batch_future = executor.submit(next, data_iter)
+        state_started = time.perf_counter()
+        train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
+        jax.block_until_ready(train_state)
+        state_ready_seconds = time.perf_counter() - state_started
+        batch = batch_future.result()
+        jax.block_until_ready(batch)
+    logging.info(
+        "Initialized first batch and train state with overlap: total_seconds=%.3f state_seconds=%.3f",
+        time.perf_counter() - overlap_started,
+        state_ready_seconds,
+    )
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
+    logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
+
+    if resuming:
+        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
     # Log images from first batch to sanity check.
     images_to_log = [
@@ -332,13 +350,6 @@ def main(config: _config.TrainConfig):
         for i in range(min(5, len(next(iter(batch[0].images.values())))))
     ]
     wandb.log({"camera_views": images_to_log}, step=0)
-
-    train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
-    jax.block_until_ready(train_state)
-    logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
-
-    if resuming:
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
