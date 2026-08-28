@@ -6,7 +6,9 @@ import pytest
 
 os.environ["JAX_PLATFORMS"] = "cpu"
 
+from openpi.training import compilation
 from openpi.training import config as _config
+from openpi.training import sharding
 
 from . import train
 
@@ -89,6 +91,66 @@ def test_capacity_parameter_norm_has_single_positional_sharding():
 def test_formal_parameter_norm_has_single_positional_sharding():
     source = pathlib.Path(__file__).with_name("train.py").read_text()
     assert "in_shardings=(train_state_sharding,)" in source
+
+
+def test_fresh_step_shape_is_strong_int32():
+    import jax
+    import numpy as np
+
+    config = _config.get_config("pi05_g2_rbdj_three_task_s0_strict")
+    shape, _ = train.init_train_state(config, jax.random.key(0), sharding.make_mesh(1), resume=True)
+    assert shape.step.dtype == np.dtype("int32")
+    assert not shape.step.weak_type
+    compilation.require_canonical_step(shape)
+
+
+def test_compilation_identity_roundtrip_and_drift(tmp_path, monkeypatch):
+    from typing import NamedTuple
+
+    import jax
+    import jax.numpy as jnp
+
+    class State(NamedTuple):
+        step: object
+        value: object
+
+    def call(rng, state, batch):
+        del rng
+        return State(state.step + 1, state.value + batch), {"sum": state.value.sum()}
+
+    monkeypatch.setenv("JAX_COMPILATION_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("OPENPI_COMPILATION_RECEIPT_DIR", str(tmp_path / "identity"))
+    mesh = sharding.make_mesh(1)
+    rep = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    state = State(jnp.asarray(0, dtype=jnp.int32), jnp.ones(2))
+    shards = State(rep, rep)
+    for _ in range(2):
+        compiled = compilation.compile_step(
+            call,
+            jax.random.key(0),
+            state,
+            jnp.ones(2),
+            mesh=mesh,
+            state_sharding=shards,
+            data_sharding=rep,
+            replicated_sharding=rep,
+        )
+        assert callable(compiled)
+    assert list((tmp_path / "cache").glob("*-cache"))
+    (tmp_path / "identity/identity.json").write_text("drift")
+    with pytest.raises(ValueError, match="identity drift"):
+        compilation.compile_step(
+            call,
+            jax.random.key(0),
+            state,
+            jnp.ones(2),
+            mesh=mesh,
+            state_sharding=shards,
+            data_sharding=rep,
+            replicated_sharding=rep,
+        )
+    with pytest.raises(ValueError, match="strong scalar int32"):
+        compilation.require_canonical_step(State(jnp.asarray(0), jnp.ones(2)))
 
 
 @pytest.mark.parametrize("config_name", ["debug"])

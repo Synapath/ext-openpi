@@ -25,6 +25,7 @@ import openpi.models.model as _model
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
+import openpi.training.compilation as _compilation
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.training.optimizer as _optimizer
@@ -200,7 +201,7 @@ def init_train_state(
         params = nnx_utils.state_map(params, config.freeze_filter, lambda p: p.replace(p.value.astype(jnp.bfloat16)))
 
         return training_utils.TrainState(
-            step=0,
+            step=jnp.asarray(0, dtype=jnp.int32),
             params=params,
             model_def=nnx.graphdef(model),
             tx=tx,
@@ -366,12 +367,24 @@ def main(config: _config.TrainConfig):
     ]
     wandb.log({"camera_views": images_to_log}, step=0)
 
-    ptrain_step = jax.jit(
-        functools.partial(train_step, config),
-        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
-        out_shardings=(train_state_sharding, replicated_sharding),
-        donate_argnums=(1,),
-    )
+    if exact_draws:
+        ptrain_step = _compilation.compile_step(
+            functools.partial(train_step, config),
+            train_rng,
+            train_state,
+            batch,
+            mesh=mesh,
+            state_sharding=train_state_sharding,
+            data_sharding=data_sharding,
+            replicated_sharding=replicated_sharding,
+        )
+    else:
+        ptrain_step = jax.jit(
+            functools.partial(train_step, config),
+            in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+            out_shardings=(train_state_sharding, replicated_sharding),
+            donate_argnums=(1,),
+        )
     pparameter_norm = jax.jit(
         parameter_norm,
         in_shardings=(train_state_sharding,),
