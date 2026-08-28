@@ -329,25 +329,34 @@ def main(config: _config.TrainConfig):
         sharding=data_sharding,
         shuffle=True,
     )
-    data_iter = iter(data_loader)
-    overlap_started = time.perf_counter()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="first-batch") as executor:
-        batch_future = executor.submit(next, data_iter)
-        state_started = time.perf_counter()
+    exact_draws = hasattr(data_loader, "commit_batch")
+    if exact_draws:
+        # Restore the committed cursor BEFORE constructing/prefetching an iterator.
         train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
-        jax.block_until_ready(train_state)
-        state_ready_seconds = time.perf_counter() - state_started
-        batch = batch_future.result()
-        jax.block_until_ready(batch)
-    logging.info(
-        "Initialized first batch and train state with overlap: total_seconds=%.3f state_seconds=%.3f",
-        time.perf_counter() - overlap_started,
-        state_ready_seconds,
-    )
+        if resuming:
+            train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        data_iter = iter(data_loader)
+        batch = next(data_iter)
+    else:
+        data_iter = iter(data_loader)
+        overlap_started = time.perf_counter()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="first-batch") as executor:
+            batch_future = executor.submit(next, data_iter)
+            state_started = time.perf_counter()
+            train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
+            jax.block_until_ready(train_state)
+            state_ready_seconds = time.perf_counter() - state_started
+            batch = batch_future.result()
+            jax.block_until_ready(batch)
+        logging.info(
+            "Initialized first batch and train state with overlap: total_seconds=%.3f state_seconds=%.3f",
+            time.perf_counter() - overlap_started,
+            state_ready_seconds,
+        )
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
-    if resuming:
+    if resuming and not exact_draws:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
     # Log images from first batch to sanity check.
@@ -384,6 +393,11 @@ def main(config: _config.TrainConfig):
     for step in pbar:
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
+        if exact_draws:
+            checked_info = jax.device_get(info)
+            if not all(np.isfinite(value).all() for value in jax.tree.leaves(checked_info)):
+                raise FloatingPointError("non-finite G2 optimizer update; exposure not acknowledged")
+            data_loader.commit_batch(step + 1)
         infos.append(info)
         if should_log_step(step=step, num_train_steps=config.num_train_steps, log_interval=config.log_interval):
             stacked_infos = common_utils.stack_forest(infos)
@@ -409,7 +423,8 @@ def main(config: _config.TrainConfig):
             _append_jsonl(metrics_path, serializable)
             infos = []
             interval_started = now
-        batch = next(data_iter)
+        if not exact_draws:
+            batch = next(data_iter)
 
         default_save = (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1
         should_save = step in requested_checkpoint_steps if requested_checkpoint_steps is not None else default_save
@@ -427,6 +442,8 @@ def main(config: _config.TrainConfig):
                 step,
                 checkpoint_info["checkpoint_save_enqueue_seconds"],
             )
+        if exact_draws and step + 1 < config.num_train_steps:
+            batch = next(data_iter)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_wait_started = time.perf_counter()
@@ -440,6 +457,8 @@ def main(config: _config.TrainConfig):
             step=last_requested_checkpoint,
         )
     wandb.finish()
+    if exact_draws:
+        data_loader.close()
 
 
 if __name__ == "__main__":

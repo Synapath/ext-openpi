@@ -76,6 +76,10 @@ class DataConfig:
     # this in the frozen config prevents a local partial mirror from silently
     # changing which episodes enter training.
     episode_indices: Sequence[int] = ()
+    # Explicit local root and exact exposure artifacts (G2 only; no fallback).
+    dataset_root: str | None = None
+    split_manifest_path: str | None = None
+    draw_manifest_path: str | None = None
     # Video decoder backend for LeRobot datasets. Forced to pyav by default because
     # torchcodec is present in some environments but not fully functional at runtime.
     video_backend: Literal["pyav", "torchcodec", "video_reader"] = "pyav"
@@ -1304,6 +1308,38 @@ def _g6_rbdj_recipe_config(base: TrainConfig) -> TrainConfig:
 
 
 _CONFIGS.append(_g6_rbdj_recipe_config(_CONFIGS[0]))
+
+
+def _g2_rbdj_recipe_config(base: TrainConfig) -> TrainConfig:
+    template = next(c for c in _g31c_recipe_configs(base)
+                    if c.name == "pi05_g31c_strict_dual_lora_interface")
+    return dataclasses.replace(
+        template,
+        name="pi05_g2_rbdj_three_task_s0_strict",
+        project_name="egovl_g2_rbdj",
+        data=dataclasses.replace(
+            template.data,
+            repo_id="RoboDojo-g2-three-task-arx-x5-joint",
+            assets=AssetsConfig(asset_id="rbdj-g2-three-task-v1"),
+            base_config=DataConfig(prompt_from_task=True, video_backend="torchcodec"),
+            adapt_to_pi=False,
+            use_delta_joint_actions=True,
+            enabled_cameras=("cam_high", "cam_left_wrist", "cam_right_wrist"),
+        ),
+        policy_metadata={
+            "task_info": {"benchmark": "RoboDojo", "tasks": ["stack_bowls", "fold_clothes", "pour_liquid_into_cup"]},
+            "robot_config": {"embodiment": "dual-arx-x5", "state_action_dim": 14,
+                             "prediction_horizon": 50, "execution_horizon": 16},
+            "recipe": "strict-dual-lora-interface",
+            "exposure": "rbdj-exact-draws-v1",
+        },
+        batch_size=64, seed=0, ema_decay=None, fsdp_devices=1, num_train_steps=10000,
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=500, peak_lr=2.5e-5,
+                                                   decay_steps=10000, decay_lr=2.5e-6),
+    )
+
+
+_CONFIGS.append(_g2_rbdj_recipe_config(_CONFIGS[0]))
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")

@@ -250,6 +250,13 @@ def create_data_loader(
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
+    if config.name == "pi05_g2_rbdj_three_task_s0_strict" or data_config.draw_manifest_path is not None:
+        if framework != "jax" or skip_norm_stats:
+            raise ValueError("Exact RoboDojo draws require normalized native JAX training")
+        from openpi.training.rbdj import ManifestDataLoader
+
+        return ManifestDataLoader(config, data_config, sharding=sharding, num_batches=num_batches)
+
     if data_config.rlds_data_dir is not None:
         return create_rlds_data_loader(
             data_config,

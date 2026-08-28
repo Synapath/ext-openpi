@@ -5,6 +5,7 @@ from collections.abc import Collection
 import concurrent.futures as futures
 import dataclasses
 import logging
+import json
 from typing import Protocol
 
 from etils import epath
@@ -78,12 +79,19 @@ def save_state(
     data_loader: _data_loader.DataLoader,
     step: int,
 ):
+    cursor = None
+    if hasattr(data_loader, "cursor_receipt"):
+        cursor = data_loader.cursor_receipt(int(jax.device_get(state.step)))
+
     def save_assets(directory: epath.Path):
         # Save the normalization stats.
         data_config = data_loader.data_config()
         norm_stats = data_config.norm_stats
         if norm_stats is not None and data_config.asset_id is not None:
             _normalize.save(directory / data_config.asset_id, norm_stats)
+        if cursor is not None:
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "data-cursor.json").write_text(json.dumps(cursor, sort_keys=True) + "\n")
 
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():
@@ -102,8 +110,6 @@ def restore_state(
     data_loader: _data_loader.DataLoader,
     step: int | None = None,
 ) -> training_utils.TrainState:
-    del data_loader
-
     with at.disable_typechecking():
         # Split params that can be used for inference into a separate item.
         train_state, params = _split_params(state)
@@ -114,7 +120,12 @@ def restore_state(
                 "params": {"params": params},
             },
         )
-    return _merge_params(restored["train_state"], restored["params"])
+    result = _merge_params(restored["train_state"], restored["params"])
+    if hasattr(data_loader, "restore_cursor"):
+        saved_step = checkpoint_manager.latest_step() if step is None else step
+        path = checkpoint_manager.directory / str(saved_step) / "assets" / "data-cursor.json"
+        data_loader.restore_cursor(json.loads(path.read_text()), int(jax.device_get(result.step)))
+    return result
 
 
 def load_norm_stats(assets_dir: epath.Path | str, asset_id: str) -> dict[str, _normalize.NormStats] | None:
