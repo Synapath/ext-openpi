@@ -53,6 +53,11 @@ def flatten(tree, path=()):
         yield path, tree
 
 
+def pure_parameter_arrays(tree) -> dict[str, np.ndarray]:
+    """Flatten an NNX pure dict, whose leaves are arrays rather than Variables."""
+    return {"/".join(path): np.asarray(value) for path, value in flatten(tree)}
+
+
 def restore(path: Path):
     with ocp.PyTreeCheckpointer() as checkpointer:
         metadata = checkpointer.metadata(path)
@@ -77,16 +82,8 @@ def fresh_reference(config):
         config.freeze_filter,
         lambda parameter: parameter.replace(parameter.value.astype(jnp.bfloat16)),
     )
-    all_parameters = {
-        "/".join(path[:-1]): np.asarray(value)
-        for path, value in flatten(state.to_pure_dict())
-        if path[-1] == "value"
-    }
-    trainable_names = {
-        "/".join(path[:-1])
-        for path, _ in flatten(state.filter(config.trainable_filter).to_pure_dict())
-        if path[-1] == "value"
-    }
+    all_parameters = pure_parameter_arrays(state.to_pure_dict())
+    trainable_names = set(pure_parameter_arrays(state.filter(config.trainable_filter).to_pure_dict()))
     return all_parameters, trainable_names
 
 
