@@ -1,5 +1,7 @@
 from flax import nnx
 import jax
+import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from openpi.models import model as _model
@@ -22,6 +24,22 @@ def test_pi0_model():
 
     actions = nnx_utils.module_jit(model.sample_actions)(key, obs, num_steps=10)
     assert actions.shape == (batch_size, model.action_horizon, model.action_dim)
+
+
+def test_pi0_component_loss_reproduces_native_loss():
+    key = jax.random.key(0)
+    config = pi0_config.Pi0Config(action_horizon=50, action_dim=14)
+    model = config.create(key)
+    obs, act = config.fake_obs(batch_size=2), config.fake_act(batch_size=2)
+
+    native = nnx_utils.module_jit(model.compute_loss)(key, obs, act)
+    components = nnx_utils.module_jit(model.compute_loss_components)(key, obs, act)
+
+    assert components.shape == (2, 50, 14)
+    np.testing.assert_allclose(native, jnp.mean(components, axis=-1), atol=5e-7, rtol=0)
+    segmented = (jnp.mean(native[:, :16]) * 16 + jnp.mean(native[:, 16:32]) * 16 + jnp.mean(native[:, 32:]) * 18) / 50
+    np.testing.assert_allclose(jnp.mean(native), segmented, atol=5e-7, rtol=0)
+    np.testing.assert_allclose(jnp.mean(native), jnp.mean(components), atol=2e-6, rtol=0)
 
 
 def test_pi0_lora_model():

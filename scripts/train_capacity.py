@@ -18,6 +18,7 @@ import etils.epath as epath
 import flax.training.common_utils as common_utils
 import jax
 import jax.numpy as jnp
+import numpy as np
 import train as _train
 import wandb
 
@@ -40,9 +41,7 @@ def main(config: _config.TrainConfig) -> None:
     if config.resume or config.overwrite:
         raise ValueError("capacity runner does not support resume or overwrite")
     if config.batch_size % jax.device_count() != 0:
-        raise ValueError(
-            f"Batch size {config.batch_size} must be divisible by device count {jax.device_count()}."
-        )
+        raise ValueError(f"Batch size {config.batch_size} must be divisible by device count {jax.device_count()}.")
 
     metrics_path_value = os.environ.get("OPENPI_METRICS_JSONL")
     metrics_path = Path(metrics_path_value) if metrics_path_value else None
@@ -51,6 +50,9 @@ def main(config: _config.TrainConfig) -> None:
     param_norm_cadence = os.environ.get("OPENPI_CAPACITY_PARAM_NORM_CADENCE", "every-step")
     if param_norm_cadence not in {"every-step", "production"}:
         raise ValueError("OPENPI_CAPACITY_PARAM_NORM_CADENCE must be 'every-step' or 'production'")
+    capacity_steps = int(os.environ.get("OPENPI_CAPACITY_STEPS", config.num_train_steps))
+    if not 0 < capacity_steps <= config.num_train_steps:
+        raise ValueError("OPENPI_CAPACITY_STEPS must be within the configured training length")
 
     _train.logging.info("Capacity runner on %s; checkpoints disabled", platform.node())
     jax_cache_dir = epath.Path(os.environ.get("JAX_COMPILATION_CACHE_DIR", "~/.cache/jax")).expanduser()
@@ -71,9 +73,13 @@ def main(config: _config.TrainConfig) -> None:
     else:
         wandb.init(mode="disabled")
 
-    data_loader = _data_loader.create_data_loader(config, sharding=data_sharding, shuffle=True)
+    data_loader = _data_loader.create_data_loader(
+        config, sharding=data_sharding, shuffle=True, num_batches=capacity_steps
+    )
     data_iter = iter(data_loader)
+    batch_started = time.perf_counter()
     batch = next(data_iter)
+    batch_wait_seconds = time.perf_counter() - batch_started
     _train.logging.info("Initialized data loader:\n%s", training_utils.array_tree_to_info(batch))
 
     train_state, train_state_sharding = _train.init_train_state(config, init_rng, mesh, resume=False)
@@ -92,11 +98,17 @@ def main(config: _config.TrainConfig) -> None:
     )
     lr_schedule = config.lr_schedule.create()
 
-    for step in range(config.num_train_steps):
+    exact_draws = hasattr(data_loader, "commit_batch")
+    for step in range(capacity_steps):
         update_started = time.perf_counter()
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         reduced_info = jax.device_get(jax.tree.map(jnp.mean, common_utils.stack_forest([info])))
+        if not all(np.isfinite(value).all() for value in jax.tree.leaves(reduced_info)):
+            raise FloatingPointError("non-finite capacity update")
+        if exact_draws:
+            data_loader.commit_batch(step + 1)
+        update_compute_seconds = time.perf_counter() - update_started
         measure_param_norm = param_norm_cadence == "every-step" or _train.should_log_step(
             step=step,
             num_train_steps=config.num_train_steps,
@@ -118,12 +130,24 @@ def main(config: _config.TrainConfig) -> None:
         serializable = {key: float(value) for key, value in reduced_info.items()}
         serializable["step"] = step
         serializable["param_norm_measured"] = float(measure_param_norm)
+        serializable["batch_wait_seconds"] = batch_wait_seconds
+        serializable["update_compute_seconds"] = update_compute_seconds
+        serializable["end_to_end_step_seconds"] = batch_wait_seconds + update_compute_seconds
+        serializable["end_to_end_samples_per_second"] = config.batch_size / (
+            batch_wait_seconds + update_compute_seconds
+        )
+        serializable["time_unix"] = time.time()
         _append_jsonl(metrics_path, serializable)
         _train.logging.info("CAPACITY_METRIC %s", json.dumps(serializable, sort_keys=True))
         wandb.log(reduced_info, step=step)
-        batch = next(data_iter)
+        if step + 1 < capacity_steps:
+            batch_started = time.perf_counter()
+            batch = next(data_iter)
+            batch_wait_seconds = time.perf_counter() - batch_started
 
     wandb.finish()
+    if hasattr(data_loader, "close"):
+        data_loader.close()
     _train.logging.info("Capacity run completed without checkpoint creation")
 
 

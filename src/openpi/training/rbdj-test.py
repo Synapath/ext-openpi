@@ -2,13 +2,15 @@ from collections import Counter
 import hashlib
 import math
 
-from flax import nnx, traverse_util
+from flax import nnx
+from flax import traverse_util
 import jax
 import numpy as np
 import pytest
 
-from openpi.training import config, rbdj
 from openpi import transforms
+from openpi.training import config
+from openpi.training import rbdj
 
 
 def test_scientific_config_and_strict_count():
@@ -36,12 +38,13 @@ def test_missing_artifacts_cannot_fall_back_to_random():
 
 class FakeDraws:
     def __getitem__(self, i):
-        return i // 64, i % 64, 9, 900, i % 20
+        return i // 32, i % 32, 9, 900, i % 20
 
 
 def cursor_loader():
     loader = object.__new__(rbdj.ManifestDataLoader)
     loader.draws = FakeDraws()
+    loader.batch_size = 32
     loader.committed_updates = 0
     loader.stop_update = 10
     loader.pending = None
@@ -54,7 +57,7 @@ def cursor_loader():
 
 def test_prefetch_is_not_a_committed_cursor_and_restore_recomputes_prefix():
     loader = cursor_loader()
-    loader.pending = np.array([loader.draws[i] for i in range(64)], dtype=np.uint32)
+    loader.pending = np.array([loader.draws[i] for i in range(32)], dtype=np.uint32)
     with pytest.raises(ValueError):
         loader.cursor_receipt(0)
     with pytest.raises(ValueError):
@@ -64,7 +67,7 @@ def test_prefetch_is_not_a_committed_cursor_and_restore_recomputes_prefix():
     restored = cursor_loader()
     restored.restore_cursor(receipt, 1)
     assert restored.cursor_receipt(1) == receipt
-    assert restored.draws[restored.committed_updates * 64] == loader.draws[64]
+    assert restored.draws[restored.committed_updates * 32] == loader.draws[32]
     with pytest.raises(ValueError):
         restored.commit_batch(2)
 
@@ -91,10 +94,13 @@ def test_native_arm_delta_and_gripper_absolute_roundtrip():
 
 def test_orbax_roundtrip_binds_committed_cursor(tmp_path):
     import json
+
     import jax.numpy as jnp
     import optax
+
     from openpi.shared import array_typing as at
-    from openpi.training import checkpoints, utils
+    from openpi.training import checkpoints
+    from openpi.training import utils
 
     tiny = nnx.Linear(2, 2, rngs=nnx.Rngs(0))
     params = nnx.state(tiny)
@@ -110,7 +116,7 @@ def test_orbax_roundtrip_binds_committed_cursor(tmp_path):
         )
     loader = cursor_loader()
     loader._data_config = config.DataConfig()
-    loader.pending = np.array([loader.draws[i] for i in range(64)], dtype=np.uint32)
+    loader.pending = np.array([loader.draws[i] for i in range(32)], dtype=np.uint32)
     loader.commit_batch(1)
     manager, _ = checkpoints.initialize_checkpoint_dir(
         tmp_path / "checkpoints", keep_period=None, overwrite=False, resume=False, checkpoint_steps={0}
