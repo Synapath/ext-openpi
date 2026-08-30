@@ -16,6 +16,7 @@ import g2debug_common
 import jax
 
 EXPECTED_TRAINABLES = {"strict": 52_153_376, "builtin": 466_957_072}
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 def sha256(path: Path) -> str:
@@ -93,8 +94,12 @@ def freeze(workers: int, output: Path) -> dict:
         "configs": configs,
         "split_sha256": sha256(g2debug_common.DATA_ROOT / "split.json"),
         "base_params_tree": str(g2debug_common.BASE_PARAMS),
-        "external_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-        "external_clean": not subprocess.check_output(["git", "status", "--porcelain"], text=True).strip(),
+        "external_commit": subprocess.check_output(
+            ["git", "-C", REPOSITORY_ROOT, "rev-parse", "HEAD"], text=True
+        ).strip(),
+        "external_clean": not subprocess.check_output(
+            ["git", "-C", REPOSITORY_ROOT, "status", "--porcelain"], text=True
+        ).strip(),
     }
     (output / "matrix.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     return result
