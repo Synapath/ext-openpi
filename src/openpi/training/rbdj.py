@@ -10,13 +10,43 @@ import os
 from pathlib import Path
 
 import jax
+from manip_datasets.robodojo_pi05 import RECORD
+from manip_datasets.robodojo_pi05 import DrawManifest
+from manip_datasets.robodojo_pi05 import sha256
 import numpy as np
 import torch
 
-from manip_datasets.robodojo import DrawManifest, RECORD, sha256
 from openpi import transforms
 from openpi.models import model
 from openpi.training import data_loader
+
+
+def verify_draws(draws: DrawManifest) -> dict:
+    """Verify either the historical three-task stream or a frozen single-task stream."""
+    train_episodes = {row["episode_id"]: row for row in draws.split["episodes"] if row["split"] == "train"}
+    expected_tasks = set(draws.metadata["task_counts"])
+    known_tasks = {row["task"] for row in train_episodes.values()}
+    if not expected_tasks or not expected_tasks <= known_tasks:
+        raise ValueError("draw manifest declares an empty or unknown task set")
+    tasks, episodes = Counter(), Counter()
+    batch_size = draws.metadata["batch_size"]
+    for index in range(len(draws)):
+        update, slot, task_index, episode_id, frame = draws[index]
+        row = train_episodes.get(episode_id)
+        if (
+            update != index // batch_size
+            or slot != index % batch_size
+            or row is None
+            or row["task"] not in expected_tasks
+            or task_index != row["task_index"]
+            or not 0 <= frame < row["anchors"]
+        ):
+            raise ValueError(f"invalid/held-out draw at record {index}")
+        tasks[row["task"]] += 1
+        episodes[str(episode_id)] += 1
+    if dict(tasks) != draws.metadata["task_counts"] or dict(episodes) != draws.metadata["episode_counts"]:
+        raise ValueError("draw count readback mismatch")
+    return {"status": "PASS", "draws": len(draws), "task_counts": dict(tasks), "episode_counts": dict(episodes)}
 
 
 class ManifestDataset:
@@ -38,7 +68,8 @@ class ManifestDataset:
             self.offsets[r["episode_id"]] = int(positions[0])
         if set(epids.tolist()) != set(self.offsets):
             raise ValueError("native dataset includes an unexpected episode")
-        with DrawManifest(manifest_path, split_path) as draws:
+        with DrawManifest(manifest_path, split_path, verify=False) as draws:
+            verify_draws(draws)
             self.length = len(draws)
 
     def __len__(self):
@@ -75,20 +106,28 @@ class ManifestDataLoader:
     def __init__(self, config, data_config, *, sharding=None, num_batches=None):
         if not all((data_config.dataset_root, data_config.draw_manifest_path, data_config.split_manifest_path)):
             raise ValueError("G2 requires explicit local root, split and draw manifest; no random fallback")
-        if jax.process_count() != 1 or config.batch_size != 64 or config.model.action_horizon != 50:
-            raise ValueError("G2 requires single-process JAX B64/H50")
-        self.draws = DrawManifest(data_config.draw_manifest_path, data_config.split_manifest_path)
-        if self.draws.metadata["batch_size"] != 64 or self.draws.metadata["updates"] != 10000:
-            raise ValueError("G2 shared exposure must be B64/U10000")
+        if jax.process_count() != 1 or config.batch_size < 1 or config.model.action_horizon != 50:
+            raise ValueError("G2 requires single-process JAX with a positive batch and H50")
+        self.draws = DrawManifest(data_config.draw_manifest_path, data_config.split_manifest_path, verify=False)
+        verify_draws(self.draws)
+        self.batch_size = config.batch_size
+        if (
+            self.draws.metadata["batch_size"] != self.batch_size
+            or self.draws.metadata["updates"] != config.num_train_steps
+        ):
+            raise ValueError("G2 draw manifest must exactly match configured batch and updates")
         self._data_config = data_config
-        episodes = [r for r in self.draws.split["episodes"] if r["split"] == "train"]
+        draw_tasks = set(self.draws.metadata["task_counts"])
+        episodes = [r for r in self.draws.split["episodes"] if r["split"] == "train" and r["task"] in draw_tasks]
         ids = [r["episode_id"] for r in episodes]
         if list(data_config.episode_indices) != ids:
-            raise ValueError("G2 config must explicitly list the 270 sorted train episode IDs")
+            raise ValueError("G2 config must explicitly list the sorted train episode IDs for its draw tasks")
         root = Path(data_config.dataset_root)
         view_path = root / "view-manifest.json"
         view = json.loads(view_path.read_text())
-        if view["split_sha256"] != self.draws.metadata["split_sha256"] or view["train_episodes"] != 270:
+        if view["split_sha256"] != self.draws.metadata["split_sha256"] or view["train_episodes"] != sum(
+            r["split"] == "train" for r in self.draws.split["episodes"]
+        ):
             raise ValueError("derived view does not match this split")
         native = data_loader.lerobot_dataset.LeRobotDataset(
             data_config.repo_id,
@@ -117,7 +156,7 @@ class ManifestDataLoader:
         self.stop_update = min(
             config.num_train_steps, num_batches if num_batches is not None else config.num_train_steps
         )
-        if not 0 < self.stop_update <= 10000:
+        if not 0 < self.stop_update <= self.draws.metadata["updates"]:
             raise ValueError("G2 update limit outside draw manifest")
         self.committed_updates = 0
         self.pending = None
@@ -140,8 +179,8 @@ class ManifestDataLoader:
         start = self.committed_updates
         kwargs = dict(
             dataset=self.dataset,
-            batch_size=64,
-            sampler=range(start * 64, self.stop_update * 64),
+            batch_size=self.batch_size,
+            sampler=range(start * self.batch_size, self.stop_update * self.batch_size),
             num_workers=self.workers,
             collate_fn=data_loader._collate_fn,
             drop_last=False,
@@ -203,7 +242,7 @@ class ManifestDataLoader:
         ):
             raise ValueError("checkpoint/exposure identity mismatch")
         prefix, tasks, episodes = hashlib.sha256(), Counter(), Counter()
-        for i in range(completed_updates * 64):
+        for i in range(completed_updates * self.batch_size):
             row = self.draws[i]
             prefix.update(RECORD.pack(*row))
             tasks[str(row[2])] += 1

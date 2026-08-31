@@ -778,9 +778,7 @@ _CONFIGS = [
             # If your dataset uses cam_high instead of stereo_right, set:
             # base_image_key="observation.images.cam_high",
         ),
-        weight_loader=weight_loaders.PartialCheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi05_base/params"
-        ),
+        weight_loader=weight_loaders.PartialCheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
         batch_size=64,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -1311,8 +1309,7 @@ _CONFIGS.append(_g6_rbdj_recipe_config(_CONFIGS[0]))
 
 
 def _g2_rbdj_recipe_config(base: TrainConfig) -> TrainConfig:
-    template = next(c for c in _g31c_recipe_configs(base)
-                    if c.name == "pi05_g31c_strict_dual_lora_interface")
+    template = next(c for c in _g31c_recipe_configs(base) if c.name == "pi05_g31c_strict_dual_lora_interface")
     return dataclasses.replace(
         template,
         name="pi05_g2_rbdj_three_task_s0_strict",
@@ -1328,18 +1325,85 @@ def _g2_rbdj_recipe_config(base: TrainConfig) -> TrainConfig:
         ),
         policy_metadata={
             "task_info": {"benchmark": "RoboDojo", "tasks": ["stack_bowls", "fold_clothes", "pour_liquid_into_cup"]},
-            "robot_config": {"embodiment": "dual-arx-x5", "state_action_dim": 14,
-                             "prediction_horizon": 50, "execution_horizon": 16},
+            "robot_config": {
+                "embodiment": "dual-arx-x5",
+                "state_action_dim": 14,
+                "prediction_horizon": 50,
+                "execution_horizon": 16,
+            },
             "recipe": "strict-dual-lora-interface",
             "exposure": "rbdj-exact-draws-v1",
         },
-        batch_size=64, seed=0, ema_decay=None, fsdp_devices=1, num_train_steps=10000,
-        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=500, peak_lr=2.5e-5,
-                                                   decay_steps=10000, decay_lr=2.5e-6),
+        batch_size=64,
+        seed=0,
+        ema_decay=None,
+        fsdp_devices=1,
+        num_train_steps=10000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500, peak_lr=2.5e-5, decay_steps=10000, decay_lr=2.5e-6
+        ),
     )
 
 
 _CONFIGS.append(_g2_rbdj_recipe_config(_CONFIGS[0]))
+
+
+def _g2debug_single_task_recipe_configs(base: TrainConfig) -> list[TrainConfig]:
+    """Register the frozen G2.0-debug task x recipe matrix."""
+    recipes = {
+        "strict": next(c for c in _g31c_recipe_configs(base) if c.name == "pi05_g31c_strict_dual_lora_interface"),
+        "builtin": next(c for c in _g31c_recipe_configs(base) if c.name == "pi05_g31c_builtin_dual_lora"),
+    }
+    tasks = {
+        "pour": "pour_liquid_into_cup",
+        "stack": "stack_bowls",
+    }
+    result = []
+    for short_task, task in tasks.items():
+        for short_recipe, template in recipes.items():
+            recipe = "strict-dual-lora-interface" if short_recipe == "strict" else "builtin-dual-lora"
+            result.append(
+                dataclasses.replace(
+                    template,
+                    name=f"pi05_g2debug_{short_task}_{short_recipe}",
+                    project_name="egovl_g2_rbdj",
+                    data=dataclasses.replace(
+                        template.data,
+                        repo_id="RoboDojo-g2-three-task-arx-x5-joint",
+                        assets=AssetsConfig(asset_id=f"rbdj-g2debug-{short_task}-v1"),
+                        base_config=DataConfig(prompt_from_task=True, video_backend="torchcodec"),
+                        adapt_to_pi=False,
+                        use_delta_joint_actions=True,
+                        enabled_cameras=("cam_high", "cam_left_wrist", "cam_right_wrist"),
+                    ),
+                    policy_metadata={
+                        "task_info": {"benchmark": "RoboDojo", "task": task},
+                        "robot_config": {
+                            "embodiment": "dual-arx-x5",
+                            "state_action_dim": 14,
+                            "prediction_horizon": 50,
+                            "execution_horizon": 16,
+                        },
+                        "recipe": recipe,
+                        "exposure": "rbdj-single-task-exact-draws-v1",
+                    },
+                    batch_size=32,
+                    seed=0,
+                    ema_decay=None,
+                    fsdp_devices=1,
+                    num_train_steps=6000,
+                    lr_schedule=_optimizer.CosineDecaySchedule(
+                        warmup_steps=300,
+                        peak_lr=2.5e-5,
+                        decay_steps=6000,
+                        decay_lr=2.5e-6,
+                    ),
+                )
+            )
+    return result
+
+
+_CONFIGS.extend(_g2debug_single_task_recipe_configs(_CONFIGS[0]))
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")

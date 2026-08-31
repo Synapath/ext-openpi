@@ -189,6 +189,17 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        return jnp.mean(self.compute_loss_components(rng, observation, actions, train=train), axis=-1)
+
+    def compute_loss_components(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> at.Float[at.Array, "*b ah ad"]:
+        """Return the native flow loss before reducing the action dimension.
+
+        This diagnostic surface uses exactly the same preprocessing, noise, time,
+        and forward pass as ``compute_loss``. Training continues to consume the
+        action-dimension mean returned by ``compute_loss``.
+        """
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -211,7 +222,7 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        return jnp.square(v_t - u_t)
 
     @override
     def sample_actions(
