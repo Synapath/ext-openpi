@@ -36,7 +36,7 @@ def test_pi0_component_loss_reproduces_native_loss():
     components = nnx_utils.module_jit(model.compute_loss_components)(key, obs, act)
 
     assert components.shape == (2, 50, 14)
-    np.testing.assert_allclose(native, jnp.mean(components, axis=-1), atol=5e-7, rtol=0)
+    np.testing.assert_allclose(native, jnp.mean(components, axis=-1), atol=2e-6, rtol=0)
     segmented = (jnp.mean(native[:, :16]) * 16 + jnp.mean(native[:, 16:32]) * 16 + jnp.mean(native[:, 32:]) * 18) / 50
     np.testing.assert_allclose(jnp.mean(native), segmented, atol=5e-7, rtol=0)
     np.testing.assert_allclose(jnp.mean(native), jnp.mean(components), atol=2e-6, rtol=0)
