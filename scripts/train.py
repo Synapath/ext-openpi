@@ -86,6 +86,16 @@ def _requested_checkpoint_steps(num_train_steps: int) -> frozenset[int] | None:
     return frozenset(steps)
 
 
+def _stage_end_update(num_train_steps: int) -> int:
+    value = os.environ.get("OPENPI_STAGE_END_UPDATE")
+    if value is None:
+        return num_train_steps
+    stage_end = int(value)
+    if not 0 < stage_end <= num_train_steps:
+        raise ValueError("OPENPI_STAGE_END_UPDATE must be in (0, num_train_steps]")
+    return stage_end
+
+
 def _tracking_metadata() -> dict[str, Any] | None:
     value = os.environ.get("OPENPI_TRACKING_METADATA_JSON")
     if value is None:
@@ -312,6 +322,7 @@ def main(config: _config.TrainConfig):
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     requested_checkpoint_steps = _requested_checkpoint_steps(config.num_train_steps)
+    stage_end_update = _stage_end_update(config.num_train_steps)
     checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
         config.checkpoint_dir,
         keep_period=config.keep_period,
@@ -392,8 +403,10 @@ def main(config: _config.TrainConfig):
     )
 
     start_step = int(train_state.step)
+    if not start_step < stage_end_update:
+        raise ValueError("checkpoint is already at or beyond OPENPI_STAGE_END_UPDATE")
     pbar = tqdm.tqdm(
-        range(start_step, config.num_train_steps),
+        range(start_step, stage_end_update),
         initial=start_step,
         total=config.num_train_steps,
         dynamic_ncols=True,
@@ -412,7 +425,7 @@ def main(config: _config.TrainConfig):
                 raise FloatingPointError("non-finite G2 optimizer update; exposure not acknowledged")
             data_loader.commit_batch(step + 1)
         infos.append(info)
-        if should_log_step(step=step, num_train_steps=config.num_train_steps, log_interval=config.log_interval):
+        if should_log_step(step=step, num_train_steps=stage_end_update, log_interval=config.log_interval):
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             reduced_info["param_norm"] = jax.device_get(pparameter_norm(train_state))
@@ -455,7 +468,7 @@ def main(config: _config.TrainConfig):
                 step,
                 checkpoint_info["checkpoint_save_enqueue_seconds"],
             )
-        if exact_draws and step + 1 < config.num_train_steps:
+        if exact_draws and step + 1 < stage_end_update:
             batch = next(data_iter)
 
     logging.info("Waiting for checkpoint manager to finish")

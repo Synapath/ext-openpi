@@ -66,6 +66,20 @@ def test_requested_checkpoint_steps(monkeypatch: pytest.MonkeyPatch):
     assert train._requested_checkpoint_steps(10) == frozenset({4, 9})  # noqa: SLF001
 
 
+def test_stage_end_update(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("OPENPI_STAGE_END_UPDATE", raising=False)
+    assert train._stage_end_update(60_000) == 60_000  # noqa: SLF001
+    monkeypatch.setenv("OPENPI_STAGE_END_UPDATE", "20000")
+    assert train._stage_end_update(60_000) == 20_000  # noqa: SLF001
+
+
+@pytest.mark.parametrize("value", ["0", "60001", "invalid"])
+def test_stage_end_update_rejects_invalid(monkeypatch: pytest.MonkeyPatch, value: str):
+    monkeypatch.setenv("OPENPI_STAGE_END_UPDATE", value)
+    with pytest.raises(ValueError, match="OPENPI_STAGE_END_UPDATE|invalid literal"):
+        train._stage_end_update(60_000)  # noqa: SLF001
+
+
 @pytest.mark.parametrize("value", ["", "4,4,9", "9,4", "4,8", "x,9", "-1,9"])
 def test_requested_checkpoint_steps_rejects_invalid(monkeypatch: pytest.MonkeyPatch, value: str):
     monkeypatch.setenv("OPENPI_CHECKPOINT_STEPS", value)

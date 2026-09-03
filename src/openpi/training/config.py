@@ -1341,6 +1341,81 @@ def _g2_rbdj_recipe_config(base: TrainConfig) -> TrainConfig:
 
 _CONFIGS.append(_g2_rbdj_recipe_config(_CONFIGS[0]))
 
+
+def _g22_rbdj_classify_config(base: TrainConfig) -> TrainConfig:
+    """Official ARX-X5 PI05 warm-start for the frozen G2.2 classify run."""
+    template = next(
+        config
+        for config in _g31c_recipe_configs(base)
+        if config.name == "pi05_g31c_builtin_dual_lora"
+    )
+    assert isinstance(template.data, LeRobotAlohaDataConfig)
+    checkpoint = (
+        "/data/xiaoliu/manip/data/robodojo-cfb06d1/ckpt/RoboDojo/"
+        "Pi_05/RoboDojo-sim-arx_x5-joint-0/59999"
+    )
+    execution = (
+        "/data/xiaoliu/manip/outputs/ego-sim-eval/g2-rbdj/"
+        "g2.2-pi05-classify-official-b128-u40k-ext60k-02/execution"
+    )
+    return dataclasses.replace(
+        template,
+        name="pi05_g22_classify_official_s0_b128_builtin_dual_lora",
+        project_name="egovl_g2_rbdj",
+        weight_loader=weight_loaders.CheckpointWeightLoader(checkpoint + "/params"),
+        data=dataclasses.replace(
+            template.data,
+            repo_id="RoboDojo-g22-classify-full100-arx-x5-joint",
+            assets=AssetsConfig(assets_dir=checkpoint + "/assets", asset_id="arx_x5_sim"),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                video_backend="pyav",
+                episode_indices=tuple(range(200, 300)),
+                dataset_root="/data/xiaoliu/manip/data/g22-classify-view",
+                split_manifest_path=execution + "/data/split.json",
+                draw_manifest_path=execution + "/data/draw-manifest.json",
+            ),
+            adapt_to_pi=False,
+            use_delta_joint_actions=True,
+            enabled_cameras=("cam_high", "cam_left_wrist", "cam_right_wrist"),
+        ),
+        checkpoint_dir_override=(
+            "/data/xiaoliu/manip/outputs/ego-sim-eval/g2-rbdj/"
+            "g2.2-pi05-classify-official-b128-u40k-ext60k-02/checkpoints"
+        ),
+        policy_metadata={
+            "task_info": {
+                "benchmark": "RoboDojo",
+                "task": "classify_objects",
+                "instruction": "Sort the objects by category into the three baskets.",
+            },
+            "robot_config": {
+                "embodiment": "dual-arx-x5",
+                "state_action_dim": 14,
+                "prediction_horizon": 50,
+                "execution_horizon": 50,
+            },
+            "recipe": "builtin-dual-lora",
+            "exposure": "g22-rbdj-classify-draws-v1",
+            "base": "RoboDojo official ARX-X5 PI05 step-59999",
+        },
+        batch_size=128,
+        seed=0,
+        ema_decay=0.99,
+        fsdp_devices=2,
+        num_workers=8,
+        num_train_steps=60_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=253,
+            peak_lr=2.5e-5,
+            decay_steps=40_000,
+            decay_lr=2.5e-6,
+        ),
+    )
+
+
+_CONFIGS.append(_g22_rbdj_classify_config(_CONFIGS[0]))
+
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}

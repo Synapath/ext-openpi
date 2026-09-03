@@ -13,16 +13,17 @@ import jax
 import numpy as np
 import torch
 
-from manip_datasets.robodojo import DrawManifest, RECORD, sha256
+from manip_datasets.robodojo_pi05 import RECORD, sha256
 from openpi import transforms
 from openpi.models import model
 from openpi.training import data_loader
 
 
 class ManifestDataset:
-    def __init__(self, native, transform, manifest_path, split_path, episodes):
+    def __init__(self, native, transform, manifest_path, split_path, episodes, draw_manifest_cls):
         self.native, self.transform = native, transform
         self.manifest_path, self.split_path = manifest_path, split_path
+        self.draw_manifest_cls = draw_manifest_cls
         self.draws = None
         epids = np.asarray(native.hf_dataset["episode_index"], dtype=np.int64).reshape(-1)
         frames = np.asarray(native.hf_dataset["frame_index"], dtype=np.int64).reshape(-1)
@@ -38,7 +39,7 @@ class ManifestDataset:
             self.offsets[r["episode_id"]] = int(positions[0])
         if set(epids.tolist()) != set(self.offsets):
             raise ValueError("native dataset includes an unexpected episode")
-        with DrawManifest(manifest_path, split_path) as draws:
+        with self.draw_manifest_cls(manifest_path, split_path) as draws:
             self.length = len(draws)
 
     def __len__(self):
@@ -51,7 +52,7 @@ class ManifestDataset:
 
     def __getitem__(self, draw_index):
         if self.draws is None:
-            self.draws = DrawManifest(self.manifest_path, self.split_path, verify=False)
+            self.draws = self.draw_manifest_cls(self.manifest_path, self.split_path, verify=False)
         identity = self.draws[int(draw_index)]
         _, _, task, episode, frame = identity
         item = self.native[self.offsets[episode] + frame]
@@ -75,20 +76,27 @@ class ManifestDataLoader:
     def __init__(self, config, data_config, *, sharding=None, num_batches=None):
         if not all((data_config.dataset_root, data_config.draw_manifest_path, data_config.split_manifest_path)):
             raise ValueError("G2 requires explicit local root, split and draw manifest; no random fallback")
-        if jax.process_count() != 1 or config.batch_size != 64 or config.model.action_horizon != 50:
-            raise ValueError("G2 requires single-process JAX B64/H50")
-        self.draws = DrawManifest(data_config.draw_manifest_path, data_config.split_manifest_path)
-        if self.draws.metadata["batch_size"] != 64 or self.draws.metadata["updates"] != 10000:
-            raise ValueError("G2 shared exposure must be B64/U10000")
+        if jax.process_count() != 1 or config.model.action_horizon != 50:
+            raise ValueError("G2 requires single-process JAX H50")
+        if config.name == "pi05_g22_classify_official_s0_b128_builtin_dual_lora":
+            from manip_datasets.robodojo_pi05_classify import DrawManifest as draw_manifest_cls
+        else:
+            from manip_datasets.robodojo import DrawManifest as draw_manifest_cls
+
+        self.draws = draw_manifest_cls(data_config.draw_manifest_path, data_config.split_manifest_path)
+        self.batch_size = config.batch_size
+        if self.draws.metadata["batch_size"] != self.batch_size:
+            raise ValueError("G2 config/draw batch mismatch")
         self._data_config = data_config
         episodes = [r for r in self.draws.split["episodes"] if r["split"] == "train"]
         ids = [r["episode_id"] for r in episodes]
         if list(data_config.episode_indices) != ids:
-            raise ValueError("G2 config must explicitly list the 270 sorted train episode IDs")
+            raise ValueError("G2 config must explicitly list the sorted train episode IDs")
         root = Path(data_config.dataset_root)
         view_path = root / "view-manifest.json"
         view = json.loads(view_path.read_text())
-        if view["split_sha256"] != self.draws.metadata["split_sha256"] or view["train_episodes"] != 270:
+        view_episode_count = view.get("episodes", view.get("train_episodes"))
+        if view["split_sha256"] != self.draws.metadata["split_sha256"] or view_episode_count != len(ids):
             raise ValueError("derived view does not match this split")
         native = data_loader.lerobot_dataset.LeRobotDataset(
             data_config.repo_id,
@@ -110,14 +118,19 @@ class ManifestDataLoader:
             ]
         )
         self.dataset = ManifestDataset(
-            native, transform, data_config.draw_manifest_path, data_config.split_manifest_path, episodes
+            native,
+            transform,
+            data_config.draw_manifest_path,
+            data_config.split_manifest_path,
+            episodes,
+            draw_manifest_cls,
         )
         self.sharding = sharding
         self.workers = config.num_workers
         self.stop_update = min(
             config.num_train_steps, num_batches if num_batches is not None else config.num_train_steps
         )
-        if not 0 < self.stop_update <= 10000:
+        if not 0 < self.stop_update <= self.draws.metadata["updates"]:
             raise ValueError("G2 update limit outside draw manifest")
         self.committed_updates = 0
         self.pending = None
@@ -140,8 +153,8 @@ class ManifestDataLoader:
         start = self.committed_updates
         kwargs = dict(
             dataset=self.dataset,
-            batch_size=64,
-            sampler=range(start * 64, self.stop_update * 64),
+            batch_size=self.batch_size,
+            sampler=range(start * self.batch_size, self.stop_update * self.batch_size),
             num_workers=self.workers,
             collate_fn=data_loader._collate_fn,
             drop_last=False,
@@ -203,7 +216,7 @@ class ManifestDataLoader:
         ):
             raise ValueError("checkpoint/exposure identity mismatch")
         prefix, tasks, episodes = hashlib.sha256(), Counter(), Counter()
-        for i in range(completed_updates * 64):
+        for i in range(completed_updates * self.batch_size):
             row = self.draws[i]
             prefix.update(RECORD.pack(*row))
             tasks[str(row[2])] += 1

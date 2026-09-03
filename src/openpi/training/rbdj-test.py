@@ -42,6 +42,7 @@ class FakeDraws:
 def cursor_loader():
     loader = object.__new__(rbdj.ManifestDataLoader)
     loader.draws = FakeDraws()
+    loader.batch_size = 64
     loader.committed_updates = 0
     loader.stop_update = 10
     loader.pending = None
