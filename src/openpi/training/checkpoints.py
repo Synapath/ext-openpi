@@ -4,8 +4,8 @@ import asyncio
 from collections.abc import Collection
 import concurrent.futures as futures
 import dataclasses
-import logging
 import json
+import logging
 from typing import Protocol
 
 from etils import epath
@@ -18,6 +18,27 @@ import openpi.shared.normalize as _normalize
 import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
 
+_ORBAX_ARRAY_HANDLER_CONFIGURED = False
+
+
+def _configure_orbax_array_handler() -> None:
+    """Avoid Orbax replica-parallel host transfers on mixed DP/FSDP meshes.
+
+    Orbax 0.11.13 may select a replicated shard on one CUDA device and execute
+    the transfer slice on another when arrays use a DP x FSDP mesh.  Disabling
+    replica-parallel serialization keeps the checkpoint contents unchanged and
+    makes each addressable shard transfer from its owning device.
+    """
+    global _ORBAX_ARRAY_HANDLER_CONFIGURED  # noqa: PLW0603
+    if _ORBAX_ARRAY_HANDLER_CONFIGURED:
+        return
+    ocp.type_handlers.register_type_handler(
+        jax.Array,
+        ocp.type_handlers.ArrayHandler(use_replica_parallel=False),
+        override=True,
+    )
+    _ORBAX_ARRAY_HANDLER_CONFIGURED = True
+
 
 def initialize_checkpoint_dir(
     checkpoint_dir: epath.Path | str,
@@ -27,6 +48,7 @@ def initialize_checkpoint_dir(
     resume: bool,
     checkpoint_steps: Collection[int] | None = None,
 ) -> tuple[ocp.CheckpointManager, bool]:
+    _configure_orbax_array_handler()
     checkpoint_dir = epath.Path(checkpoint_dir).resolve()
     resuming = False
     if checkpoint_dir.exists():
