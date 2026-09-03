@@ -1361,6 +1361,7 @@ def _g22_rbdj_classify_config(base: TrainConfig) -> TrainConfig:
     return dataclasses.replace(
         template,
         name="pi05_g22_classify_official_s0_b128_builtin_dual_lora",
+        model=dataclasses.replace(template.model, lora_zero_init_b=True),
         project_name="egovl_g2_rbdj",
         weight_loader=weight_loaders.CheckpointWeightLoader(checkpoint + "/params"),
         data=dataclasses.replace(

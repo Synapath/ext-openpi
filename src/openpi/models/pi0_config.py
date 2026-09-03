@@ -20,6 +20,8 @@ class Pi0Config(_model.BaseModelConfig):
     dtype: str = "bfloat16"
     paligemma_variant: _gemma.Variant = "gemma_2b"
     action_expert_variant: _gemma.Variant = "gemma_300m"
+    # Keep the builtin LoRA graph while starting from the exact dense policy.
+    lora_zero_init_b: bool = False
 
     # Set the model specific defaults.
     action_dim: int = 32

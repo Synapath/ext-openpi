@@ -11,6 +11,7 @@ def test_g22_classify_official_recipe_is_frozen():
     assert config.fsdp_devices == 2
     assert config.num_workers == 8
     assert config.num_train_steps == 60_000
+    assert config.model.lora_zero_init_b
     assert config.lr_schedule.warmup_steps == 253
     assert config.lr_schedule.decay_steps == 40_000
     assert tuple(data.episode_indices) == tuple(range(200, 300))

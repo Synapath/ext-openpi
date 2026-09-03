@@ -50,6 +50,21 @@ def test_lora_einsum_same_output():
     assert jnp.allclose(output, output_lora)
 
 
+def test_lora_zero_init_b_has_zero_delta_and_live_gradient_path():
+    shape = (3, 8, 32, 4)
+    dense = lora.Einsum(shape)
+    adapted = lora.Einsum(shape, lora_config=lora.LoRAConfig(rank=2, zero_init_b=True))
+    key = jax.random.key(0)
+    x = jax.random.normal(key, (8, 64, 32))
+    equation = "BSD,3KDH->3BSKH"
+    dense_params = dense.init(key, equation, x)
+    adapted_params = adapted.init(key, equation, x)
+
+    assert jnp.any(adapted_params["params"]["lora_a"] != 0)
+    assert jnp.all(adapted_params["params"]["lora_b"] == 0)
+    assert jnp.array_equal(dense.apply(dense_params, equation, x), adapted.apply(adapted_params, equation, x))
+
+
 def test_lora_ffn_params_shape():
     ffn = lora.FeedForward(features=8, hidden_dim=32)
     ffn_lora = lora.FeedForward(

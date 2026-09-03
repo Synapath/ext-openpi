@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 
 import einops
@@ -69,6 +70,15 @@ class Pi0(_model.BaseModel):
         self.pi05 = config.pi05
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
+        if config.lora_zero_init_b:
+            paligemma_config.lora_configs = {
+                name: dataclasses.replace(value, zero_init_b=True)
+                for name, value in paligemma_config.lora_configs.items()
+            }
+            action_expert_config.lora_configs = {
+                name: dataclasses.replace(value, zero_init_b=True)
+                for name, value in action_expert_config.lora_configs.items()
+            }
         # TODO: rewrite gemma in NNX. For now, use bridge.
         llm = nnx_bridge.ToNNX(
             _gemma.Module(
