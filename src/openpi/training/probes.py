@@ -133,8 +133,9 @@ class FixedProbes:
                 mask = temporal_mask(item, split, episodes[r["episode_id"]], r["frame"])
                 raw_items.append(
                     {
-                        "state": np.asarray(item["observation.state"]),
-                        "actions": np.asarray(item["action"]),
+                        # DeltaActions mutates its input; retain absolute physical targets.
+                        "state": np.asarray(item["observation.state"]).copy(),
+                        "actions": np.asarray(item["action"]).copy(),
                         "valid_mask": np.ones(split["horizon"], dtype=bool) if mask is None else mask,
                     }
                 )

@@ -2,6 +2,54 @@ from openpi.training.probes import aggregate
 from openpi.training.probes import select_anchors
 
 
+def test_fixed_probe_keeps_absolute_targets_through_inplace_delta_transform(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from openpi import transforms
+    from openpi.training import probes
+
+    state = np.arange(14, dtype=np.float32) / 10
+    absolute = np.broadcast_to(state + 0.25, (32, 14)).copy()
+    split_path = tmp_path / "split.json"
+    split_path.write_text(json.dumps({"episodes": [{"episode_id": 1}], "horizon": 32}))
+    records = [{"episode_id": 1, "frame": 0, "task_index": 23}]
+
+    class Native:
+        meta = SimpleNamespace(tasks={})
+        hf_dataset = {"episode_index": [1], "frame_index": [0]}
+
+        def __getitem__(self, index):
+            assert index == 0
+            return {"observation.state": state.copy(), "action": absolute.copy(), "task_index": 23}
+
+    monkeypatch.setattr(probes, "select_anchors", lambda *args: records)
+    monkeypatch.setattr(probes, "temporal_mask", lambda *args: None)
+    monkeypatch.setattr(probes.data_loader.lerobot_dataset, "LeRobotDataset", lambda *args, **kwargs: Native())
+    monkeypatch.setattr(transforms, "PromptFromLeRobotTask", lambda *args: lambda item: item)
+    monkeypatch.setattr(transforms, "Normalize", lambda *args, **kwargs: lambda item: item)
+    mask = transforms.make_bool_mask(6, -1, 6, -1)
+    dc = SimpleNamespace(
+        split_manifest_path=split_path, repo_id="test", dataset_root=tmp_path,
+        video_backend="pyav", action_sequence_keys=("action",), norm_stats={}, use_quantile_norm=True,
+        repack_transforms=transforms.Group(inputs=[transforms.RepackTransform(
+            {"state": "observation.state", "actions": "action"}
+        )]),
+        data_transforms=transforms.Group(inputs=[transforms.DeltaActions(mask)]),
+        model_transforms=transforms.Group(),
+    )
+    config = SimpleNamespace(data=SimpleNamespace(create=lambda *args: dc), assets_dirs=tmp_path,
+                             model=SimpleNamespace(action_horizon=32))
+    fixed = probes.FixedProbes(config, tmp_path / "manifest.json")
+    for partition in ("train", "val"):
+        np.testing.assert_array_equal(fixed.raw[partition][0]["actions"], absolute)
+        np.testing.assert_array_equal(fixed.raw[partition][0]["state"], state)
+        expected_delta = absolute - np.where(mask, state, 0)[None]
+        np.testing.assert_array_equal(fixed.batches[partition]["actions"][0], expected_delta)
+
+
 def test_episode_weighting_does_not_favor_longer_probe_inventory():
     rows = [{"episode_id": 1}, {"episode_id": 1}, {"episode_id": 2}]
     result = aggregate({"flow_mse": [1.0, 3.0, 10.0]}, rows)
