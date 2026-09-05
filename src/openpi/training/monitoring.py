@@ -50,6 +50,8 @@ def trainable_health(state, config):
 
 
 def system_metrics():
+    # These are explicit history metrics, not W&B's separate system stream.
+    # The system/ prefix makes sampled chart queries resolve to that empty stream.
     result = {}
     try:
         text = subprocess.check_output(
@@ -64,12 +66,12 @@ def system_metrics():
         for line in text.splitlines():
             index, memory, util, temp = [int(x.strip()) for x in line.split(",")]
             for key, val in (("gpu_memory_reserved_mib", memory), ("gpu_util", util), ("temperature_c", temp)):
-                result[f"system/gpu{index}/{key}"] = val
-        result["system/nvml_available"] = 1
+                result[f"hardware/gpu{index}/{key}"] = val
+        result["hardware/nvml_available"] = 1
     except (OSError, ValueError, subprocess.SubprocessError):
-        result["system/nvml_available"] = 0
+        result["hardware/nvml_available"] = 0
     for device in jax.local_devices():
         stats = device.memory_stats()
         if stats and "peak_bytes_in_use" in stats:
-            result[f"system/gpu{device.id}/jax_peak_active_gib"] = stats["peak_bytes_in_use"] / 2**30
+            result[f"hardware/gpu{device.id}/jax_peak_active_gib"] = stats["peak_bytes_in_use"] / 2**30
     return result
