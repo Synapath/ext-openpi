@@ -144,6 +144,48 @@ def should_log_step(*, step: int, num_train_steps: int, log_interval: int) -> bo
     return (step + 1) % log_interval == 0 or step == num_train_steps - 1
 
 
+def numeric_wandb_config(config: _config.TrainConfig) -> dict[str, Any]:
+    """Do not serialize host paths, loaders, or arbitrary tracking metadata online."""
+    values = {
+        "recipe": config.name,
+        "seed": config.seed,
+        "global_batch": config.batch_size,
+        "planned_updates": config.num_train_steps,
+        "prediction_horizon": config.model.action_horizon,
+        "ema_decay": config.ema_decay,
+        "ema_trainable_only": config.ema_trainable_only,
+        "mask_action_padding": config.mask_action_padding,
+        "fsdp_devices": config.fsdp_devices,
+        "lr_schedule": dataclasses.asdict(config.lr_schedule),
+        "optimizer": dataclasses.asdict(config.optimizer),
+    }
+    for key in ("plan_id", "task", "execution_horizon", "state_action_dim", "adapt_to_pi"):
+        if key in (config.policy_metadata or {}):
+            values[key] = config.policy_metadata[key]
+    if population := _nominal_dataset_size():
+        values["nominal_dataset_size"] = population
+    # Only content identities are allowed from the run-owned environment binding.
+    for key, value in (_tracking_metadata() or {}).items():
+        if key in {
+            "source_manifest_sha256", "split_sha256", "norm_sha256", "draw_manifest_sha256",
+            "protocol_sha256", "base_manifest_sha256", "openpi_commit", "manip_commit",
+        }:
+            if not isinstance(value, str) or len(value) not in (40, 64) or any(c not in "0123456789abcdef" for c in value):
+                raise ValueError(f"invalid content identity: {key}")
+            values[key] = value
+    return values
+
+
+def log_first_batch_images(config, batch, completed_updates):
+    if config.wandb_numeric_only:
+        return
+    images = [
+        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
+        for i in range(min(5, len(next(iter(batch[0].images.values())))))
+    ]
+    wandb.log({"camera_views": images, "train/updates": int(completed_updates)})
+
+
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
     if not enabled:
         wandb.init(mode="disabled")
@@ -152,18 +194,26 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
     ckpt_dir = config.checkpoint_dir
     if not ckpt_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
+    settings = None
+    if config.wandb_numeric_only:
+        settings = wandb.Settings(
+            disable_git=True, x_disable_meta=True, x_disable_stats=True, x_disable_machine_info=True,
+            x_save_requirements=False, save_code=False, console="off",
+        )
     if resuming:
         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
+        wandb.init(id=run_id, resume="must", project=config.project_name, settings=settings)
     else:
         wandb.init(
             name=config.exp_name,
-            config=dataclasses.asdict(config),
+            config=numeric_wandb_config(config) if config.wandb_numeric_only else dataclasses.asdict(config),
             project=config.project_name,
+            settings=settings,
+            resume="never" if config.wandb_numeric_only else None,
         )
         (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
 
-    if overrides := wandb_config_overrides():
+    if not config.wandb_numeric_only and (overrides := wandb_config_overrides()):
         wandb.config.update(overrides, allow_val_change=True)
 
     # The SDK history step advances per log call; completed updates are the plot axis.
@@ -171,7 +221,7 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
     wandb.define_metric("train/updates")
     wandb.define_metric("*", step_metric="train/updates")
 
-    if log_code:
+    if log_code and not config.wandb_numeric_only:
         wandb.run.log_code(epath.Path(__file__).parent.parent)
 
 
@@ -402,12 +452,7 @@ def main(config: _config.TrainConfig):
     if resuming and not exact_draws:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
-    # Log images from first batch to sanity check.
-    images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
-    ]
-    wandb.log({"camera_views": images_to_log, "train/updates": int(train_state.step)})
+    log_first_batch_images(config, batch, train_state.step)
 
     if exact_draws:
         ptrain_step = _compilation.compile_step(

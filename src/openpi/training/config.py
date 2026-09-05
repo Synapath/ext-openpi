@@ -534,6 +534,8 @@ class TrainConfig:
 
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
+    # Restrict tracking to numerical history and allowlisted scientific configuration.
+    wandb_numeric_only: bool = False
 
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
@@ -985,7 +987,7 @@ _RLT_MODEL = pi0_config.Pi0Config(
     pi05=True, action_horizon=32, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
 )
 _CONFIGS.append(TrainConfig(
-    name="pi05_rlt_charger_r1_0a", project_name="egovl_g2_rbdj",
+    name="pi05_rlt_charger_r1_0a", project_name="rlt_pi05_rbdj", wandb_numeric_only=True,
     model=_RLT_MODEL, freeze_filter=_RLT_MODEL.get_freeze_filter(),
     weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
     data=LeRobotAlohaDataConfig(

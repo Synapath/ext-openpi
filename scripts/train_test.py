@@ -48,3 +48,41 @@ def test_rlt_rejects_unverified_backend_before_creating_run(tmp_path, monkeypatc
     with pytest.raises(ValueError, match="requires XLA_FLAGS"):
         train.main(config)
     assert not config.checkpoint_dir.exists()
+
+
+def test_numeric_wandb_excludes_paths_images_code_and_dependency_inventory(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    config = dataclasses.replace(
+        _config.get_config("pi05_rlt_charger_r1_0a"),
+        checkpoint_base_dir=str(tmp_path / "private-checkpoints"),
+        exp_name="numeric-only",
+    )
+    config.checkpoint_dir.mkdir(parents=True)
+    monkeypatch.setenv("OPENPI_TRACKING_METADATA_JSON", json.dumps({
+        "host_path": "/private/host", "source_manifest_sha256": "a" * 64,
+    }))
+    captured = []
+    fake_run = SimpleNamespace(id="test-id", log_code=lambda *_: pytest.fail("code uploaded"))
+    monkeypatch.setattr(train.wandb, "init", lambda **kw: captured.append(kw))
+    monkeypatch.setattr(train.wandb, "run", fake_run)
+    monkeypatch.setattr(train.wandb, "define_metric", lambda *_a, **_k: None)
+    monkeypatch.setattr(train.wandb, "log", lambda *_a, **_k: pytest.fail("image history uploaded"))
+    monkeypatch.setattr(train.wandb, "Image", lambda *_a, **_k: pytest.fail("image created"))
+    train.init_wandb(config, resuming=False, log_code=True)
+    train.log_first_batch_images(config, None, 0)
+    first = captured[0]
+    assert first["project"] == "rlt_pi05_rbdj"
+    assert first["resume"] == "never"
+    assert "/private" not in json.dumps(first["config"])
+    assert first["config"]["source_manifest_sha256"] == "a" * 64
+    assert first["settings"].x_save_requirements is False
+    assert first["settings"].x_disable_machine_info is True
+    assert first["settings"].x_disable_meta is True
+    assert first["settings"].x_disable_stats is True
+    assert first["settings"].save_code is False
+    assert first["settings"].console == "off"
+    train.init_wandb(config, resuming=True, log_code=True)
+    assert captured[1]["id"] == "test-id"
+    assert captured[1]["resume"] == "must"
+    assert captured[1]["settings"].x_save_requirements is False
