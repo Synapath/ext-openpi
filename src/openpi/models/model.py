@@ -106,6 +106,9 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # Supervision-only temporal mask; never supplied for policy inference.
+    action_valid_mask: at.Bool[ArrayT, "*b ah"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -126,6 +129,7 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            action_valid_mask=data.get("action_valid_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -139,6 +143,15 @@ class Observation(Generic[ArrayT]):
 # Defines the format of the actions. This field is included as "actions" inside the dictionary
 # produced by the data transforms.
 Actions = at.Float[ArrayT, "*b ah ad"]
+
+
+def weight_action_loss(loss, valid_mask):
+    """Return per-time losses whose global mean uses only real target elements."""
+    if valid_mask is None:
+        return loss
+    if valid_mask.shape != loss.shape:
+        raise ValueError("action valid mask/loss shape mismatch")
+    return jnp.where(valid_mask, loss, 0) * (valid_mask.size / jnp.maximum(valid_mask.sum(), 1))
 
 
 def preprocess_observation(
@@ -205,6 +218,7 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        action_valid_mask=observation.action_valid_mask,
     )
 
 

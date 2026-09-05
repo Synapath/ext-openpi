@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Collection
 import concurrent.futures as futures
 import dataclasses
+import json
 import logging
 from typing import Protocol
 
 from etils import epath
+from flax import nnx
 import jax
 import orbax.checkpoint as ocp
 import orbax.checkpoint.future as future
@@ -18,7 +21,12 @@ import openpi.training.utils as training_utils
 
 
 def initialize_checkpoint_dir(
-    checkpoint_dir: epath.Path | str, *, keep_period: int | None, overwrite: bool, resume: bool
+    checkpoint_dir: epath.Path | str,
+    *,
+    keep_period: int | None,
+    overwrite: bool,
+    resume: bool,
+    checkpoint_steps: Collection[int] | None = None,
 ) -> tuple[ocp.CheckpointManager, bool]:
     checkpoint_dir = epath.Path(checkpoint_dir).resolve()
     resuming = False
@@ -37,6 +45,10 @@ def initialize_checkpoint_dir(
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    # Exact save steps are zero-based and may not align with a periodic retention rule.
+    max_to_keep = len(checkpoint_steps) if checkpoint_steps is not None else 1
+    retention_period = None if checkpoint_steps is not None else keep_period
+
     mngr = ocp.CheckpointManager(
         checkpoint_dir,
         item_handlers={
@@ -45,8 +57,8 @@ def initialize_checkpoint_dir(
             "params": ocp.PyTreeCheckpointHandler(),
         },
         options=ocp.CheckpointManagerOptions(
-            max_to_keep=1,
-            keep_period=keep_period,
+            max_to_keep=max_to_keep,
+            keep_period=retention_period,
             create=False,
             async_options=ocp.AsyncOptions(timeout_secs=7200),
         ),
@@ -68,12 +80,19 @@ def save_state(
     data_loader: _data_loader.DataLoader,
     step: int,
 ):
+    cursor = None
+    if hasattr(data_loader, "cursor_receipt"):
+        cursor = data_loader.cursor_receipt(int(jax.device_get(state.step)))
+
     def save_assets(directory: epath.Path):
         # Save the normalization stats.
         data_config = data_loader.data_config()
         norm_stats = data_config.norm_stats
         if norm_stats is not None and data_config.asset_id is not None:
             _normalize.save(directory / data_config.asset_id, norm_stats)
+        if cursor is not None:
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "data-cursor.json").write_text(json.dumps(cursor, sort_keys=True) + "\n")
 
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():
@@ -92,8 +111,6 @@ def restore_state(
     data_loader: _data_loader.DataLoader,
     step: int | None = None,
 ) -> training_utils.TrainState:
-    del data_loader
-
     with at.disable_typechecking():
         # Split params that can be used for inference into a separate item.
         train_state, params = _split_params(state)
@@ -104,7 +121,12 @@ def restore_state(
                 "params": {"params": params},
             },
         )
-    return _merge_params(restored["train_state"], restored["params"])
+    result = _merge_params(restored["train_state"], restored["params"])
+    if hasattr(data_loader, "restore_cursor"):
+        saved_step = checkpoint_manager.latest_step() if step is None else step
+        path = checkpoint_manager.directory / str(saved_step) / "assets" / "data-cursor.json"
+        data_loader.restore_cursor(json.loads(path.read_text()), int(jax.device_get(result.step)))
+    return result
 
 
 def load_norm_stats(assets_dir: epath.Path | str, asset_id: str) -> dict[str, _normalize.NormStats] | None:
@@ -143,6 +165,11 @@ class CallbackRestore(ocp.args.CheckpointArgs): ...
 
 
 def _split_params(state: training_utils.TrainState) -> tuple[training_utils.TrainState, at.Params]:
+    if state.ema_trainable_only:
+        if state.ema_params is None:
+            raise ValueError("trainable-only checkpoint requires EMA state")
+        # Keep raw/Adam/partial EMA together; export a complete inference tree.
+        return state, inference_params(state)
     if state.ema_params is not None:
         params = state.ema_params
         train_state = dataclasses.replace(state, ema_params=None)
@@ -154,6 +181,19 @@ def _split_params(state: training_utils.TrainState) -> tuple[training_utils.Trai
 
 def _merge_params(train_state: training_utils.TrainState, params: dict[str, at.Params]) -> training_utils.TrainState:
     # Revert the logic inside `_split_params`. Assumes that existence of `params` means that EMA params were used during the split.
+    if train_state.ema_trainable_only:
+        return train_state
     if train_state.params:
         return dataclasses.replace(train_state, ema_params=params["params"])
     return dataclasses.replace(train_state, params=params["params"])
+
+
+def inference_params(state):
+    """Compose full inference weights without arithmetic on frozen BF16 leaves."""
+    if state.ema_params is None:
+        return state.params
+    if not state.ema_trainable_only:
+        return state.ema_params
+    merged = nnx.State(state.params)
+    merged.replace_by_pure_dict(state.ema_params.to_pure_dict())
+    return merged

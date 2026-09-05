@@ -21,6 +21,7 @@ class TrainState:
 
     ema_decay: float | None = struct.field(pytree_node=False)
     ema_params: nnx.State | None = None
+    ema_trainable_only: bool = struct.field(pytree_node=False, default=False)
 
 
 @at.typecheck

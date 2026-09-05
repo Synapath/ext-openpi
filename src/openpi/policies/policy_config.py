@@ -54,7 +54,10 @@ def create_trained_policy(
         model = train_config.model.load_pytorch(train_config, weight_path)
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
-        model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
+        # RLT exports already carry frozen BF16 + trainable FP32. Preserve that
+        # inference identity so offline full-sampler diagnostics match serving.
+        dtype = None if train_config.ema_trainable_only else jnp.bfloat16
+        model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=dtype))
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     if norm_stats is None:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure

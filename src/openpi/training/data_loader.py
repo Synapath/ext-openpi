@@ -7,7 +7,12 @@ from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+try:
+    import lerobot.datasets.lerobot_dataset as lerobot_dataset
+except ModuleNotFoundError as exc:
+    if exc.name != "lerobot.datasets":
+        raise
+    import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
@@ -240,6 +245,12 @@ def create_data_loader(
         framework: The framework to use ("jax" or "pytorch").
     """
     data_config = config.data.create(config.assets_dirs, config.model)
+    if data_config.draw_manifest_path is not None:
+        if framework != "jax" or skip_norm_stats:
+            raise ValueError("exact-draw training requires JAX and verified normalization")
+        from openpi.training.rbdj import ManifestDataLoader
+        return ManifestDataLoader(config, data_config, sharding=sharding, num_batches=num_batches)
+
     logging.info(f"data_config: {data_config}")
 
     if data_config.rlds_data_dir is not None:

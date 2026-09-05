@@ -65,6 +65,11 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    episode_indices: Sequence[int] = ()
+    dataset_root: str | None = None
+    split_manifest_path: str | None = None
+    draw_manifest_path: str | None = None
+    video_backend: Literal["pyav", "torchcodec", "video_reader"] = "pyav"
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -488,6 +493,11 @@ class TrainConfig:
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
     ema_decay: float | None = 0.99
+    ema_trainable_only: bool = False
+    diagnostics: bool = False
+    require_deterministic_ops: bool = False
+    mask_action_padding: bool = False
+    max_updates: int | None = None
 
     # Specifies which weights should be frozen.
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
@@ -969,6 +979,30 @@ _CONFIGS = [
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
 ]
+
+# R1.0a recipe; local payload/draw paths must be bound explicitly before use.
+_RLT_MODEL = pi0_config.Pi0Config(
+    pi05=True, action_horizon=32, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+)
+_CONFIGS.append(TrainConfig(
+    name="pi05_rlt_charger_r1_0a", project_name="egovl_g2_rbdj",
+    model=_RLT_MODEL, freeze_filter=_RLT_MODEL.get_freeze_filter(),
+    weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+    data=LeRobotAlohaDataConfig(
+        repo_id="RoboDojo-rlt-charger-h32-masked-v2", adapt_to_pi=False, use_delta_joint_actions=True,
+        assets=AssetsConfig(asset_id="charger-h32-masked-v2"),
+        base_config=DataConfig(prompt_from_task=True, video_backend="pyav"),
+        repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({
+            "images": {k: "observation.images." + k for k in ("cam_high", "cam_left_wrist", "cam_right_wrist")},
+            "state": "observation.state", "actions": "action", "prompt": "prompt",
+        })]),
+    ),
+    batch_size=128, num_train_steps=20_000, seed=0, fsdp_devices=1,
+    ema_decay=0.99, ema_trainable_only=True, diagnostics=True, require_deterministic_ops=True, mask_action_padding=True,
+    lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=1000, peak_lr=2.5e-5, decay_steps=20_000, decay_lr=2.5e-6),
+    policy_metadata={"plan_id": "R1.0a", "task": "plug_in_charger", "prediction_horizon": 32,
+                     "execution_horizon": 16, "state_action_dim": 14, "adapt_to_pi": False},
+))
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")

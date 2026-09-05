@@ -1,0 +1,314 @@
+"""Native LeRobot/transform adapter for the versioned RoboDojo exposure artifacts."""
+
+from __future__ import annotations
+
+from collections import Counter
+import hashlib
+import json
+import multiprocessing
+import os
+from pathlib import Path
+
+import jax
+from manip_datasets.robodojo_pi05 import RECORD
+from manip_datasets.robodojo_pi05 import DrawManifest
+from manip_datasets.robodojo_pi05 import sha256
+import numpy as np
+import torch
+
+from openpi import transforms
+from openpi.models import model
+from openpi.training import data_loader
+
+
+def verify_draws(draws: DrawManifest) -> dict:
+    """Verify either the historical three-task stream or a frozen single-task stream."""
+    train_episodes = {row["episode_id"]: row for row in draws.split["episodes"] if row["split"] == "train"}
+    expected_tasks = set(draws.metadata["task_counts"])
+    known_tasks = {row["task"] for row in train_episodes.values()}
+    if not expected_tasks or not expected_tasks <= known_tasks:
+        raise ValueError("draw manifest declares an empty or unknown task set")
+    tasks, episodes = Counter(), Counter()
+    batch_size = draws.metadata["batch_size"]
+    for index in range(len(draws)):
+        update, slot, task_index, episode_id, frame = draws[index]
+        row = train_episodes.get(episode_id)
+        if (
+            update != index // batch_size
+            or slot != index % batch_size
+            or row is None
+            or row["task"] not in expected_tasks
+            or task_index != row["task_index"]
+            or not 0 <= frame < row["anchors"]
+        ):
+            raise ValueError(f"invalid/held-out draw at record {index}")
+        tasks[row["task"]] += 1
+        episodes[str(episode_id)] += 1
+    if dict(tasks) != draws.metadata["task_counts"] or dict(episodes) != draws.metadata["episode_counts"]:
+        raise ValueError("draw count readback mismatch")
+    return {"status": "PASS", "draws": len(draws), "task_counts": dict(tasks), "episode_counts": dict(episodes)}
+
+
+def temporal_mask(item, split, row, frame):
+    """Cross-check native padding and exclude the source's fake final action."""
+    from manip_datasets.robodojo_pi05 import MASKED_SCHEMA
+    from manip_datasets.robodojo_pi05 import valid_length
+
+    horizon = split["horizon"]
+    native_pad = np.asarray(item["action_is_pad"], dtype=bool)
+    expected_pad = np.arange(horizon) + frame >= row["length"]
+    if native_pad.shape != (horizon,) or not np.array_equal(native_pad, expected_pad):
+        raise ValueError("native temporal padding differs from source episode length")
+    if split["schema"] != MASKED_SCHEMA:
+        if native_pad.any():
+            raise ValueError("unexpected temporal padding at complete anchor")
+        return None
+    return np.arange(horizon) < valid_length(split["schema"], row["length"], frame)
+
+
+class ManifestDataset:
+    def __init__(self, native, transform, manifest_path, split_path, episodes):
+        self.native, self.transform = native, transform
+        self.manifest_path, self.split_path = manifest_path, split_path
+        self.draws = None
+        self.episodes = {r["episode_id"]: r for r in episodes}
+        self.split = json.loads(Path(split_path).read_text())
+        epids = np.asarray(native.hf_dataset["episode_index"], dtype=np.int64).reshape(-1)
+        frames = np.asarray(native.hf_dataset["frame_index"], dtype=np.int64).reshape(-1)
+        self.offsets = {}
+        for r in episodes:
+            positions = np.flatnonzero(epids == r["episode_id"])
+            if (
+                len(positions) != r["length"]
+                or not np.array_equal(frames[positions], np.arange(r["length"]))
+                or not np.array_equal(positions, np.arange(positions[0], positions[0] + len(positions)))
+            ):
+                raise ValueError("native dataset episode mapping mismatch")
+            self.offsets[r["episode_id"]] = int(positions[0])
+        if set(epids.tolist()) != set(self.offsets):
+            raise ValueError("native dataset includes an unexpected episode")
+        with DrawManifest(manifest_path, split_path, verify=False) as draws:
+            verify_draws(draws)
+            self.length = len(draws)
+
+    def __len__(self):
+        return self.length
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["draws"] = None
+        return state
+
+    def __getitem__(self, draw_index):
+        if self.draws is None:
+            self.draws = DrawManifest(self.manifest_path, self.split_path, verify=False)
+        identity = self.draws[int(draw_index)]
+        _, _, task, episode, frame = identity
+        item = self.native[self.offsets[episode] + frame]
+        actual = (int(item["task_index"]), int(item["episode_index"]), int(item["frame_index"]))
+        if actual != (task, episode, frame):
+            raise ValueError(f"native loader identity drift: {actual} != {identity}")
+        mask = temporal_mask(item, self.split, self.episodes[episode], frame)
+        item = self.transform(item)
+        if mask is not None:
+            item["action_valid_mask"] = mask
+            item["actions"] = np.where(mask[:, None], item["actions"], 0)
+        item["_draw_identity"] = np.array(identity, dtype=np.uint32)
+        return item
+
+
+def worker_init(_):
+    os.environ["JAX_PLATFORMS"] = "cpu"
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+    torch.set_num_threads(1)
+
+
+class ManifestDataLoader:
+    def __init__(self, config, data_config, *, sharding=None, num_batches=None):
+        if not all((data_config.dataset_root, data_config.draw_manifest_path, data_config.split_manifest_path)):
+            raise ValueError("G2 requires explicit local root, split and draw manifest; no random fallback")
+        if jax.process_count() != 1 or config.batch_size < 1:
+            raise ValueError("G2 requires single-process JAX with a positive batch")
+        self.draws = DrawManifest(data_config.draw_manifest_path, data_config.split_manifest_path, verify=False)
+        verify_draws(self.draws)
+        from manip_datasets.robodojo_pi05 import MASKED_SCHEMA
+
+        if config.mask_action_padding != (self.draws.split["schema"] == MASKED_SCHEMA):
+            raise ValueError("configured loss mask does not match split profile")
+        if self.draws.split["horizon"] != config.model.action_horizon:
+            raise ValueError("model/draw horizon mismatch")
+        self.batch_size = config.batch_size
+        if (
+            self.draws.metadata["batch_size"] != self.batch_size
+            or self.draws.metadata["updates"] != config.num_train_steps
+        ):
+            raise ValueError("G2 draw manifest must exactly match configured batch and updates")
+        self._data_config = data_config
+        draw_tasks = set(self.draws.metadata["task_counts"])
+        episodes = [r for r in self.draws.split["episodes"] if r["split"] == "train" and r["task"] in draw_tasks]
+        ids = [r["episode_id"] for r in episodes]
+        if list(data_config.episode_indices) != ids:
+            raise ValueError("G2 config must explicitly list the sorted train episode IDs for its draw tasks")
+        root = Path(data_config.dataset_root)
+        view_path = root / "view-manifest.json"
+        view = json.loads(view_path.read_text())
+        if view["split_sha256"] != self.draws.metadata["split_sha256"] or view["train_episodes"] != sum(
+            r["split"] == "train" for r in self.draws.split["episodes"]
+        ):
+            raise ValueError("derived view does not match this split")
+        # Bind actual payload and consumed normalization, not only manifest filenames.
+        for relative, expected in view["files"].items():
+            if sha256(root / relative) != expected:
+                raise ValueError(f"view payload changed: {relative}")
+        norm_root = Path(config.data.assets.assets_dir or config.assets_dirs)
+        norm_path = norm_root / data_config.asset_id / "norm_stats.json"
+        if sha256(norm_path) != view["norm_sha256"]:
+            raise ValueError("normalization payload changed")
+        from openpi.shared import normalize
+
+        expected_norm = normalize.load(norm_path.parent)
+        if data_config.norm_stats is None or set(data_config.norm_stats) != set(expected_norm):
+            raise ValueError("consumed normalization identity mismatch")
+        for key in expected_norm:
+            for field in ("mean", "std", "q01", "q99"):
+                if not np.array_equal(getattr(data_config.norm_stats[key], field), getattr(expected_norm[key], field)):
+                    raise ValueError("consumed normalization values mismatch")
+        native = data_loader.lerobot_dataset.LeRobotDataset(
+            data_config.repo_id,
+            root=root,
+            episodes=ids,
+            download_videos=False,
+            delta_timestamps={
+                key: [t / 25 for t in range(config.model.action_horizon)] for key in data_config.action_sequence_keys
+            },
+            video_backend=data_config.video_backend,
+        )
+        if data_config.norm_stats is None:
+            raise ValueError("G2 train-only normalization is required")
+        transform = transforms.compose(
+            [
+                transforms.PromptFromLeRobotTask(native.meta.tasks),
+                *data_config.repack_transforms.inputs,
+                *data_config.data_transforms.inputs,
+                transforms.Normalize(data_config.norm_stats, use_quantiles=data_config.use_quantile_norm),
+                *data_config.model_transforms.inputs,
+            ]
+        )
+        self.dataset = ManifestDataset(
+            native, transform, data_config.draw_manifest_path, data_config.split_manifest_path, episodes
+        )
+        self.sharding = sharding
+        self.workers = config.num_workers
+        self.stop_update = min(
+            config.num_train_steps, num_batches if num_batches is not None else config.num_train_steps
+        )
+        if not 0 < self.stop_update <= self.draws.metadata["updates"]:
+            raise ValueError("G2 update limit outside draw manifest")
+        self.committed_updates = 0
+        self.pending = None
+        self.prefix = hashlib.sha256()
+        self.task_counts, self.episode_counts = Counter(), Counter()
+        self.identity = {
+            "draw_manifest_sha256": sha256(data_config.draw_manifest_path),
+            "split_sha256": sha256(data_config.split_manifest_path),
+            "view_manifest_sha256": sha256(view_path),
+        }
+        self.readback_path = os.environ.get("OPENPI_DRAW_READBACK")
+        self._torch_loader = None
+
+    def data_config(self):
+        return self._data_config
+
+    def __iter__(self):
+        if self.pending is not None:
+            raise ValueError("previous batch has not been acknowledged")
+        start = self.committed_updates
+        kwargs = {
+            "dataset": self.dataset,
+            "batch_size": self.batch_size,
+            "sampler": range(start * self.batch_size, self.stop_update * self.batch_size),
+            "num_workers": self.workers,
+            "collate_fn": data_loader._collate_fn,  # noqa: SLF001 - share native loader collation
+            "drop_last": False,
+            "worker_init_fn": worker_init,
+            "generator": torch.Generator().manual_seed(0),
+        }
+        if self.workers:
+            kwargs.update(
+                multiprocessing_context=multiprocessing.get_context("spawn"), persistent_workers=True, prefetch_factor=2
+            )
+        self._torch_loader = torch.utils.data.DataLoader(**kwargs)
+        for update, batch in enumerate(self._torch_loader, start=start):
+            if self.pending is not None or update != self.committed_updates:
+                raise ValueError("prefetch cannot advance committed exposure")
+            actual = batch.pop("_draw_identity")
+            if not np.array_equal(actual, np.asarray(self.draws.batch(update), dtype=np.uint32)):
+                raise ValueError("collated actual-consumption readback mismatch")
+            self.pending = actual
+            if self.sharding is not None:
+                placed = jax.tree.map(lambda x: jax.make_array_from_process_local_data(self.sharding, x), batch)
+            else:
+                placed = batch
+            yield model.Observation.from_dict(placed), placed["actions"]
+
+    def commit_batch(self, completed_updates):
+        if self.pending is None or completed_updates != self.committed_updates + 1:
+            raise ValueError("invalid optimizer/exposure acknowledgement")
+        actual = self.pending
+        for row in actual:
+            self.prefix.update(RECORD.pack(*(int(x) for x in row)))
+            self.task_counts[str(int(row[2]))] += 1
+            self.episode_counts[str(int(row[3]))] += 1
+        if self.readback_path:
+            record = {
+                "completed_updates": completed_updates,
+                "actual_draws": actual.tolist(),
+                "prefix_sha256": self.prefix.hexdigest(),
+            }
+            with Path(self.readback_path).open("a") as f:
+                f.write(json.dumps(record, separators=(",", ":")) + "\n")
+        self.committed_updates = completed_updates
+        self.pending = None
+
+    def cursor_receipt(self, completed_updates):
+        if self.pending is not None or completed_updates != self.committed_updates:
+            raise ValueError("checkpoint cursor does not match completed updates")
+        return dict(
+            schema="rbdj-cursor-v1",
+            **self.identity,
+            completed_updates=completed_updates,
+            prefix_sha256=self.prefix.hexdigest(),
+            task_counts=dict(self.task_counts),
+            episode_counts=dict(self.episode_counts),
+        )
+
+    def restore_cursor(self, receipt, completed_updates):
+        if (
+            receipt.get("schema") != "rbdj-cursor-v1"
+            or completed_updates != receipt["completed_updates"]
+            or any(receipt[k] != v for k, v in self.identity.items())
+            or not 0 <= completed_updates <= self.stop_update
+            or self.pending is not None
+        ):
+            raise ValueError("checkpoint/exposure identity mismatch")
+        prefix, tasks, episodes = hashlib.sha256(), Counter(), Counter()
+        for i in range(completed_updates * self.batch_size):
+            row = self.draws[i]
+            prefix.update(RECORD.pack(*row))
+            tasks[str(row[2])] += 1
+            episodes[str(row[3])] += 1
+        if (
+            prefix.hexdigest() != receipt["prefix_sha256"]
+            or dict(tasks) != receipt["task_counts"]
+            or dict(episodes) != receipt["episode_counts"]
+        ):
+            raise ValueError("checkpoint draw-prefix verification failed")
+        self.prefix, self.task_counts, self.episode_counts = prefix, tasks, episodes
+        self.committed_updates = completed_updates
+
+    def close(self):
+        if self._torch_loader is not None:
+            iterator = getattr(self._torch_loader, "_iterator", None)
+            if iterator is not None:
+                iterator._shutdown_workers()  # noqa: SLF001 - PyTorch has no public loader close
+        self.draws.close()
