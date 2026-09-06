@@ -236,6 +236,22 @@ class Pi0(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
+        return self._sample_actions_prefix(rng, observation, num_steps=num_steps, noise=noise)[0]
+
+    def extract_prefix(self, observation):
+        """Frozen final-layer prefix for token-only feature extraction."""
+        observation = _model.preprocess_observation(None, observation, train=False)
+        tokens, mask, ar_mask = self.embed_prefix(observation)
+        outputs, _ = self.PaliGemma.llm(
+            [tokens, None], mask=make_attn_mask(mask, ar_mask), positions=jnp.cumsum(mask, axis=1)-1
+        )
+        return jax.lax.stop_gradient(outputs[0]), mask
+
+    def sample_actions_with_prefix(self, rng, observation, *, num_steps=10, noise=None):
+        """Same action path, exposing its frozen final prefix and validity mask."""
+        return self._sample_actions_prefix(rng, observation, num_steps=num_steps, noise=noise)
+
+    def _sample_actions_prefix(self, rng, observation, *, num_steps=10, noise=None):
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -248,7 +264,7 @@ class Pi0(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        prefix_outputs, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
         def step(carry):
             x_t, time = carry
@@ -290,4 +306,4 @@ class Pi0(_model.BaseModel):
             return time >= -dt / 2
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
-        return x_0
+        return x_0, jax.lax.stop_gradient(prefix_outputs[0]), prefix_mask
