@@ -151,7 +151,7 @@ def _reconstruction_loss(
     mask: jax.Array | None = None,
 ) -> jax.Array:
     target_embeddings = jax.lax.stop_gradient(target_embeddings)
-    residual = predictions - target_embeddings
+    residual = predictions.astype(jnp.float32) - target_embeddings.astype(jnp.float32)
     if mask is not None:
         residual = jnp.where(mask[..., None], residual, 0)
     recon_sq = jnp.square(residual)
@@ -194,7 +194,9 @@ def compute_reconstruction_ablation_metrics(
     first_valid = jnp.ones(target_embeddings.shape[0], dtype=bool) if mask is None else mask[:, 0]
 
     def first_loss(predictions):
-        residual = jnp.where(first_valid[:, None], predictions[:, 0] - target_embeddings[:, 0], 0)
+        residual = jnp.where(
+            first_valid[:, None], predictions[:, 0].astype(jnp.float32) - target_embeddings[:, 0].astype(jnp.float32), 0
+        )
         total = jnp.square(residual).sum()
         return jnp.where(first_valid.any(), total / jnp.maximum(first_valid.sum(), 1), jnp.nan)
 
@@ -221,8 +223,11 @@ class ARTokenConfig:
     num_heads: int = 8
     mlp_dim: int = 8192
     num_layers: int = 2
+    compute_dtype: str = "float32"
 
     def __post_init__(self):
+        if self.compute_dtype not in {"float32", "bfloat16"}:
+            raise ValueError("token compute dtype")
         if min(self.dim, self.num_heads, self.mlp_dim, self.num_layers) <= 0 or self.dim % self.num_heads:
             raise ValueError("positive dimensions and head divisibility required")
 
@@ -233,6 +238,10 @@ class ARToken(nnx.Module):
         args = (config.dim, config.num_heads, config.mlp_dim, config.num_layers, rngs)
         self.encoder = RLTokenEncoder(*args)
         self.decoder = RLTokenDecoder(*args)
+        # Parameters/Adam remain FP32; only module arithmetic uses selected dtype.
+        for _, module in nnx.iter_graph(self):
+            if isinstance(module, nnx.Linear | nnx.RMSNorm):
+                module.dtype = jnp.dtype(config.compute_dtype)
 
     def encode(self, prefix, mask):
         return self.encoder(jax.lax.stop_gradient(prefix), mask)

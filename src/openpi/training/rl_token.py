@@ -24,6 +24,16 @@ def _step(token, optimizer, prefix, mask):
     return loss, optax.global_norm(grad.to_pure_dict())
 
 
+@nnx.jit
+def _gradient(token, prefix, mask):
+    return nnx.value_and_grad(lambda m: m.loss(prefix, mask))(token)
+
+
+@nnx.jit
+def _apply_gradient(optimizer, grad):
+    optimizer.update(grad)
+
+
 class TokenTrainer:
     def __init__(self, config=ARTokenConfig(), *, seed=0, learning_rate=1e-4, base_id):
         if not base_id or not np.isfinite(learning_rate) or learning_rate <= 0:
@@ -49,6 +59,38 @@ class TokenTrainer:
             raise FloatingPointError("nonfinite token update rolled back")
         self.updates += 1
         return {"token/reconstruction_l2": float(loss), "token/grad_norm": float(grad)}
+
+    def update_accumulated(self, microbatches):
+        """One Adam step for an example-weighted batch, without retaining activations."""
+        before = nnx.state((self.token, self.optimizer))
+        total, count, grad_sum = 0.0, 0, None
+        try:
+            for prefix, mask in microbatches:
+                validate_features(prefix, mask)
+                if prefix.shape[-1] != self.token.config.dim:
+                    raise ValueError("feature width")
+                loss, grad = _gradient(self.token, jnp.asarray(prefix), jnp.asarray(mask))
+                n = prefix.shape[0]
+                total += float(loss) * n
+                count += n
+                weighted = jax.tree.map(lambda x, n=n: x.astype(jnp.float32) * n, grad)
+                grad_sum = weighted if grad_sum is None else jax.tree.map(jnp.add, grad_sum, weighted)
+            if not count:
+                raise ValueError("empty accumulated batch")
+            grad = jax.tree.map(lambda x: x / count, grad_sum)
+            norm = optax.global_norm(grad.to_pure_dict())
+            if not np.isfinite([total / count, float(norm)]).all():
+                raise FloatingPointError("nonfinite accumulated gradient")
+            _apply_gradient(self.optimizer, grad)
+            if not all(
+                np.isfinite(np.asarray(x)).all() for x in jax.tree.leaves(nnx.state((self.token, self.optimizer)))
+            ):
+                raise FloatingPointError("nonfinite token state")
+        except BaseException:
+            nnx.update((self.token, self.optimizer), before)
+            raise
+        self.updates += 1
+        return {"token/reconstruction_l2": total / count, "token/grad_norm": float(norm)}
 
     def save(self, path):
         payload = {

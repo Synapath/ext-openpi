@@ -50,7 +50,7 @@ class RLTPolicy:
                     "actions": np.array(actions[0]),
                 }
             )
-            outputs.update(rl_token=np.array(token[0]), base_id=self.base_id, token_id=self.token_id)
+            outputs.update(rl_token=np.array(token[0], dtype=np.float32), base_id=self.base_id, token_id=self.token_id)
             return outputs
 
     @property

@@ -124,3 +124,27 @@ def test_pinned_reference_encoder_decoder_and_gradients():
     g2 = nnx.grad(lambda m: m(z, x, mask).sum())(ref_decoder)
     for a, b in zip(jax.tree.leaves(g1), jax.tree.leaves(g2), strict=True):
         np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-5)
+
+
+def test_accumulated_gradient_matches_full_batch_and_bf16_config():
+    import flax.nnx as nnx
+    import jax
+    import numpy as np
+
+    from openpi.models.rl_token import ARTokenConfig
+    from openpi.training.rl_token import TokenTrainer
+
+    cfg = ARTokenConfig(dim=8, num_heads=2, mlp_dim=16, num_layers=1)
+    x = np.random.default_rng(3).normal(size=(2, 3, 8)).astype(np.float32)
+    mask = np.ones((2, 3), dtype=bool)
+    a = TokenTrainer(cfg, seed=2, base_id="test")
+    b = TokenTrainer(cfg, seed=2, base_id="test")
+    a.update(x, mask)
+    b.update_accumulated([(x[:1], mask[:1]), (x[1:], mask[1:])])
+    for left, right in zip(jax.tree.leaves(nnx.state(a.token)), jax.tree.leaves(nnx.state(b.token)), strict=True):
+        np.testing.assert_allclose(left, right, atol=2e-6, rtol=2e-5)
+    c = TokenTrainer(
+        ARTokenConfig(dim=8, num_heads=2, mlp_dim=16, num_layers=1, compute_dtype="bfloat16"), base_id="test"
+    )
+    assert str(c.token.encoder.layers["layer_0"].q_proj.dtype) == "bfloat16"
+    assert np.isfinite(c.update_accumulated([(x[:1], mask[:1])])["token/reconstruction_l2"])
