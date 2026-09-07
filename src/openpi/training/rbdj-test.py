@@ -90,6 +90,36 @@ def test_native_arm_delta_and_gripper_absolute_roundtrip():
     np.testing.assert_allclose(restored, actions, atol=5e-7, rtol=0)
 
 
+def test_validation_dataset_enumerates_each_anchor_without_padding():
+    class Native:
+        hf_dataset = {
+            "episode_index": np.array([201, 201, 201, 207, 207, 207, 207]),
+            "frame_index": np.array([0, 1, 2, 0, 1, 2, 3]),
+        }
+
+        def __getitem__(self, index):
+            return {
+                "task_index": 2,
+                "episode_index": int(self.hf_dataset["episode_index"][index]),
+                "frame_index": int(self.hf_dataset["frame_index"][index]),
+                "action_is_pad": np.zeros(50, dtype=bool),
+            }
+
+    rows = [
+        {"episode_id": 201, "task_index": 2, "length": 3, "anchors": 2},
+        {"episode_id": 207, "task_index": 2, "length": 4, "anchors": 3},
+    ]
+    dataset = rbdj.ValidationDataset(Native(), lambda item: item, rows)
+    assert len(dataset) == 5
+    assert [(dataset[index]["episode_index"], dataset[index]["frame_index"]) for index in range(len(dataset))] == [
+        (201, 0),
+        (201, 1),
+        (207, 0),
+        (207, 1),
+        (207, 2),
+    ]
+
+
 def test_orbax_roundtrip_binds_committed_cursor(tmp_path):
     import json
     import jax.numpy as jnp

@@ -151,6 +151,26 @@ def should_log_step(*, step: int, num_train_steps: int, log_interval: int) -> bo
     return step % log_interval == 0 or step == num_train_steps - 1
 
 
+def should_validate_step(*, step: int, stage_end_update: int, interval: int) -> bool:
+    if interval <= 0:
+        raise ValueError("validation_interval must be positive")
+    return (step + 1) % interval == 0 or step + 1 == stage_end_update
+
+
+def action_position_loss_metrics(chunked_loss: at.Array) -> dict[str, at.Array]:
+    """Keep the optimizer scalar and expose diagnostic H50 position windows."""
+    metrics = {"loss": jnp.mean(chunked_loss)}
+    if chunked_loss.shape[-1] == 50:
+        metrics.update(
+            {
+                "loss_offset_00_19": jnp.mean(chunked_loss[..., :20]),
+                "loss_offset_20_39": jnp.mean(chunked_loss[..., 20:40]),
+                "loss_offset_40_49": jnp.mean(chunked_loss[..., 40:50]),
+            }
+        )
+    return metrics
+
+
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
     if not enabled:
         wandb.init(mode="disabled")
@@ -255,14 +275,17 @@ def train_step(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        metrics = action_position_loss_metrics(chunked_loss)
+        return metrics["loss"], metrics
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    (loss, loss_metrics), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions
+    )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -282,10 +305,42 @@ def train_step(
         )
 
     info = {
+        **loss_metrics,
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
     }
     return new_state, info
+
+
+@at.typecheck
+def validation_step(
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+) -> dict[str, at.Array]:
+    model = nnx.merge(state.model_def, state.params)
+    model.eval()
+    observation, actions = batch
+    chunked_loss = model.compute_loss(rng, observation, actions, train=False)
+    return action_position_loss_metrics(chunked_loss)
+
+
+def run_validation(validation_loader, pvalidation_step, state) -> dict[str, float | int]:
+    weighted_sums: dict[str, float] = {}
+    sample_count = 0
+    validation_rng = jax.random.key(0)
+    for batch_index, batch in enumerate(validation_loader):
+        batch_size = int(batch[1].shape[0])
+        metrics = jax.device_get(pvalidation_step(jax.random.fold_in(validation_rng, batch_index), state, batch))
+        for key, value in metrics.items():
+            weighted_sums[key] = weighted_sums.get(key, 0.0) + float(value) * batch_size
+        sample_count += batch_size
+    if sample_count <= 0:
+        raise ValueError("validation loader produced no samples")
+    result: dict[str, float | int] = {f"validation_{key}": value / sample_count for key, value in weighted_sums.items()}
+    result["validation_samples"] = sample_count
+    result["validation_batches"] = len(validation_loader)
+    return result
 
 
 def parameter_norm(state: training_utils.TrainState) -> at.Array:
@@ -376,7 +431,7 @@ def main(config: _config.TrainConfig):
         wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
         for i in range(min(5, len(next(iter(batch[0].images.values())))))
     ]
-    wandb.log({"camera_views": images_to_log}, step=0)
+    wandb.log({"camera_views": images_to_log}, step=0, commit=False)
 
     if exact_draws:
         ptrain_step = _compilation.compile_step(
@@ -401,6 +456,23 @@ def main(config: _config.TrainConfig):
         in_shardings=(train_state_sharding,),
         out_shardings=replicated_sharding,
     )
+    validation_loader = (
+        data_loader.create_validation_loader() if hasattr(data_loader, "create_validation_loader") else None
+    )
+    if validation_loader is not None:
+        if config.validation_interval is None:
+            raise ValueError("validation data requires validation_interval")
+        pvalidation_step = jax.jit(
+            validation_step,
+            in_shardings=(
+                replicated_sharding,
+                train_state_sharding,
+                data_sharding,
+            ),
+            out_shardings=replicated_sharding,
+        )
+    else:
+        pvalidation_step = None
 
     start_step = int(train_state.step)
     if not start_step < stage_end_update:
@@ -417,6 +489,7 @@ def main(config: _config.TrainConfig):
     interval_started = time.perf_counter()
     last_requested_checkpoint: int | None = None
     for step in pbar:
+        wandb_payload = {}
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         if exact_draws:
@@ -443,12 +516,27 @@ def main(config: _config.TrainConfig):
             )
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
+            wandb_payload.update(reduced_info)
             serializable = {key: float(value) for key, value in reduced_info.items()}
             serializable["step"] = step
             _append_jsonl(metrics_path, serializable)
             infos = []
             interval_started = now
+        if validation_loader is not None and should_validate_step(
+            step=step,
+            stage_end_update=stage_end_update,
+            interval=config.validation_interval,
+        ):
+            validation_started = time.perf_counter()
+            validation_info = run_validation(validation_loader, pvalidation_step, train_state)
+            validation_info["validation_seconds"] = time.perf_counter() - validation_started
+            wandb_payload.update(validation_info)
+            validation_record = dict(validation_info, step=step)
+            _append_jsonl(metrics_path, validation_record)
+            pbar.write(
+                f"Step {step} validation: " + ", ".join(f"{key}={value:.4f}" for key, value in validation_info.items())
+            )
+            interval_started += validation_info["validation_seconds"]
         if not exact_draws:
             batch = next(data_iter)
 
@@ -462,12 +550,14 @@ def main(config: _config.TrainConfig):
                 "checkpoint_save_requested_step": step,
                 "checkpoint_save_enqueue_seconds": time.perf_counter() - save_started,
             }
-            wandb.log(checkpoint_info, step=step)
+            wandb_payload.update(checkpoint_info)
             logging.info(
                 "Checkpoint save requested: step=%d enqueue_seconds=%.3f",
                 step,
                 checkpoint_info["checkpoint_save_enqueue_seconds"],
             )
+        if wandb_payload:
+            wandb.log(wandb_payload, step=step)
         if exact_draws and step + 1 < stage_end_update:
             batch = next(data_iter)
 
@@ -475,16 +565,13 @@ def main(config: _config.TrainConfig):
     checkpoint_wait_started = time.perf_counter()
     checkpoint_manager.wait_until_finished()
     if last_requested_checkpoint is not None:
-        wandb.log(
-            {
-                "latest_complete_checkpoint_step": last_requested_checkpoint,
-                "checkpoint_final_wait_seconds": time.perf_counter() - checkpoint_wait_started,
-            },
-            step=last_requested_checkpoint,
-        )
+        wandb.run.summary["latest_complete_checkpoint_step"] = last_requested_checkpoint
+        wandb.run.summary["checkpoint_final_wait_seconds"] = time.perf_counter() - checkpoint_wait_started
     wandb.finish()
     if exact_draws:
         data_loader.close()
+    if validation_loader is not None:
+        validation_loader.close()
 
 
 if __name__ == "__main__":

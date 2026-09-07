@@ -76,6 +76,9 @@ class DataConfig:
     # this in the frozen config prevents a local partial mirror from silently
     # changing which episodes enter training.
     episode_indices: Sequence[int] = ()
+    # Optional episode-level validation set. These episodes are excluded from
+    # exact training draws and evaluated without optimizer updates.
+    validation_episode_indices: Sequence[int] = ()
     # Explicit local root and exact exposure artifacts (G2 only; no fallback).
     dataset_root: str | None = None
     split_manifest_path: str | None = None
@@ -606,6 +609,9 @@ class TrainConfig:
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
+    # Optional full validation sweep cadence. The stage endpoint is always
+    # evaluated when validation data is configured.
+    validation_interval: int | None = None
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
@@ -1416,6 +1422,58 @@ def _g22_rbdj_classify_config(base: TrainConfig) -> TrainConfig:
 
 
 _CONFIGS.append(_g22_rbdj_classify_config(_CONFIGS[0]))
+
+
+_G22_VALIDATION_EPISODES = (201, 207, 208, 211, 213, 223, 248, 254, 291, 294)
+_G22_TRAIN_EPISODES = tuple(
+    episode
+    for episode in range(200, 300)
+    if episode not in _G22_VALIDATION_EPISODES
+)
+
+
+def _g22_rbdj_classify_train90_val10_config(base: TrainConfig) -> TrainConfig:
+    """Fresh G2.2 run with an episode-level 90/10 train/validation split."""
+    assert isinstance(base.data, LeRobotAlohaDataConfig)
+    assert base.data.base_config is not None
+    output = (
+        "/data/xiaoliu/manip/outputs/ego-sim-eval/g2-rbdj/"
+        "g2.2-pi05-classify-official-b128-u40k-ext60k-03-train90-val10"
+    )
+    data = dataclasses.replace(
+        base.data,
+        repo_id="RoboDojo-g22-classify-train90-val10-arx-x5-joint",
+        base_config=dataclasses.replace(
+            base.data.base_config,
+            episode_indices=_G22_TRAIN_EPISODES,
+            validation_episode_indices=_G22_VALIDATION_EPISODES,
+            dataset_root="/data/xiaoliu/manip/data/g22-classify-train90-val10-view",
+            split_manifest_path=output + "/execution/data/split.json",
+            draw_manifest_path=output + "/execution/data/draw-manifest.json",
+        ),
+    )
+    metadata = dict(base.policy_metadata or {})
+    metadata["robot_config"] = {
+        **metadata.get("robot_config", {}),
+        "execution_horizon": 20,
+    }
+    metadata.update(
+        {
+            "exposure": "g22-rbdj-classify-train90-val10-draws-v1",
+            "validation": "episode-level-seed0-full-anchor-sweep-every1000",
+        }
+    )
+    return dataclasses.replace(
+        base,
+        name="pi05_g22_classify_official_s0_b128_builtin_dual_lora_train90_val10",
+        data=data,
+        checkpoint_dir_override=output + "/checkpoints",
+        validation_interval=1_000,
+        policy_metadata=metadata,
+    )
+
+
+_CONFIGS.append(_g22_rbdj_classify_train90_val10_config(_CONFIGS[-1]))
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")

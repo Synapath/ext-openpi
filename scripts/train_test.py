@@ -9,6 +9,8 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 from openpi.training import compilation
 from openpi.training import config as _config
 from openpi.training import sharding
+import jax.numpy as jnp
+import numpy as np
 
 from . import train
 
@@ -48,6 +50,42 @@ def test_should_log_step(step: int, expected: int):
 def test_should_log_step_rejects_nonpositive_interval():
     with pytest.raises(ValueError, match="log_interval"):
         train.should_log_step(step=0, num_train_steps=2, log_interval=0)
+
+
+@pytest.mark.parametrize(
+    ("step", "expected"),
+    [(0, False), (998, False), (999, True), (1000, False), (1999, True)],
+)
+def test_should_validate_step(step: int, expected: bool):
+    assert train.should_validate_step(step=step, stage_end_update=2_000, interval=1_000) is expected
+
+
+def test_should_validate_step_always_includes_stage_end():
+    assert train.should_validate_step(step=1_234, stage_end_update=1_235, interval=1_000)
+    with pytest.raises(ValueError, match="validation_interval"):
+        train.should_validate_step(step=0, stage_end_update=1, interval=0)
+
+
+def test_h50_position_metrics_preserve_optimizer_loss():
+    chunked = jnp.arange(100, dtype=jnp.float32).reshape(2, 50)
+    metrics = train.action_position_loss_metrics(chunked)
+    assert set(metrics) == {
+        "loss",
+        "loss_offset_00_19",
+        "loss_offset_20_39",
+        "loss_offset_40_49",
+    }
+    reconstructed = (
+        20 * metrics["loss_offset_00_19"] + 20 * metrics["loss_offset_20_39"] + 10 * metrics["loss_offset_40_49"]
+    ) / 50
+    np.testing.assert_allclose(metrics["loss"], reconstructed, atol=1e-6, rtol=0)
+
+
+def test_non_h50_position_metrics_keep_original_loss_only():
+    chunked = jnp.arange(32, dtype=jnp.float32).reshape(2, 16)
+    metrics = train.action_position_loss_metrics(chunked)
+    assert set(metrics) == {"loss"}
+    np.testing.assert_allclose(metrics["loss"], jnp.mean(chunked))
 
 
 def test_tracking_metadata(monkeypatch: pytest.MonkeyPatch):

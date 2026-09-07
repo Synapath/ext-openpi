@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections import Counter
 import hashlib
 import json
+import math
 import multiprocessing
 import os
 from pathlib import Path
@@ -66,10 +68,83 @@ class ManifestDataset:
         return item
 
 
+class ValidationDataset:
+    """Every full-H50 anchor from held-out episodes, in stable episode order."""
+
+    def __init__(self, native, transform, episodes):
+        self.native, self.transform = native, transform
+        epids = np.asarray(native.hf_dataset["episode_index"], dtype=np.int64).reshape(-1)
+        frames = np.asarray(native.hf_dataset["frame_index"], dtype=np.int64).reshape(-1)
+        self.episodes = episodes
+        self.offsets, self.ends = {}, []
+        total = 0
+        for row in episodes:
+            positions = np.flatnonzero(epids == row["episode_id"])
+            if (
+                len(positions) != row["length"]
+                or not np.array_equal(frames[positions], np.arange(row["length"]))
+                or not np.array_equal(positions, np.arange(positions[0], positions[0] + len(positions)))
+            ):
+                raise ValueError("validation episode mapping mismatch")
+            self.offsets[row["episode_id"]] = int(positions[0])
+            total += row["anchors"]
+            self.ends.append(total)
+        if set(epids.tolist()) != set(self.offsets):
+            raise ValueError("validation dataset includes an unexpected episode")
+
+    def __len__(self):
+        return self.ends[-1]
+
+    def __getitem__(self, index):
+        index = int(index)
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        episode_index = bisect_right(self.ends, index)
+        previous_end = self.ends[episode_index - 1] if episode_index else 0
+        row = self.episodes[episode_index]
+        frame = index - previous_end
+        item = self.native[self.offsets[row["episode_id"]] + frame]
+        actual = (
+            int(item["task_index"]),
+            int(item["episode_index"]),
+            int(item["frame_index"]),
+        )
+        expected = (row["task_index"], row["episode_id"], frame)
+        if actual != expected or np.asarray(item["action_is_pad"]).any():
+            raise ValueError(f"validation anchor identity drift: {actual} != {expected}")
+        return self.transform(item)
+
+
 def worker_init(_):
     os.environ["JAX_PLATFORMS"] = "cpu"
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     torch.set_num_threads(1)
+
+
+def _native_and_transform(data_config, ids):
+    native = data_loader.lerobot_dataset.LeRobotDataset(
+        data_config.repo_id,
+        root=Path(data_config.dataset_root),
+        episodes=ids,
+        download_videos=False,
+        delta_timestamps={key: [t / 25 for t in range(50)] for key in data_config.action_sequence_keys},
+        video_backend=data_config.video_backend,
+    )
+    if data_config.norm_stats is None:
+        raise ValueError("G2 train/validation normalization is required")
+    transform = transforms.compose(
+        [
+            transforms.PromptFromLeRobotTask(native.meta.tasks),
+            *data_config.repack_transforms.inputs,
+            *data_config.data_transforms.inputs,
+            transforms.Normalize(
+                data_config.norm_stats,
+                use_quantiles=data_config.use_quantile_norm,
+            ),
+            *data_config.model_transforms.inputs,
+        ]
+    )
+    return native, transform
 
 
 class ManifestDataLoader:
@@ -78,7 +153,7 @@ class ManifestDataLoader:
             raise ValueError("G2 requires explicit local root, split and draw manifest; no random fallback")
         if jax.process_count() != 1 or config.model.action_horizon != 50:
             raise ValueError("G2 requires single-process JAX H50")
-        if config.name == "pi05_g22_classify_official_s0_b128_builtin_dual_lora":
+        if data_config.repo_id.startswith("RoboDojo-g22-classify-"):
             from manip_datasets.robodojo_pi05_classify import DrawManifest as draw_manifest_cls
         else:
             from manip_datasets.robodojo import DrawManifest as draw_manifest_cls
@@ -96,27 +171,11 @@ class ManifestDataLoader:
         view_path = root / "view-manifest.json"
         view = json.loads(view_path.read_text())
         view_episode_count = view.get("episodes", view.get("train_episodes"))
-        if view["split_sha256"] != self.draws.metadata["split_sha256"] or view_episode_count != len(ids):
+        if view["split_sha256"] != self.draws.metadata["split_sha256"] or view_episode_count != len(
+            self.draws.split["episodes"]
+        ):
             raise ValueError("derived view does not match this split")
-        native = data_loader.lerobot_dataset.LeRobotDataset(
-            data_config.repo_id,
-            root=root,
-            episodes=ids,
-            download_videos=False,
-            delta_timestamps={key: [t / 25 for t in range(50)] for key in data_config.action_sequence_keys},
-            video_backend=data_config.video_backend,
-        )
-        if data_config.norm_stats is None:
-            raise ValueError("G2 train-only normalization is required")
-        transform = transforms.compose(
-            [
-                transforms.PromptFromLeRobotTask(native.meta.tasks),
-                *data_config.repack_transforms.inputs,
-                *data_config.data_transforms.inputs,
-                transforms.Normalize(data_config.norm_stats, use_quantiles=data_config.use_quantile_norm),
-                *data_config.model_transforms.inputs,
-            ]
-        )
+        native, transform = _native_and_transform(data_config, ids)
         self.dataset = ManifestDataset(
             native,
             transform,
@@ -143,6 +202,7 @@ class ManifestDataLoader:
         )
         self.readback_path = os.environ.get("OPENPI_DRAW_READBACK")
         self._torch_loader = None
+        self._config = config
 
     def data_config(self):
         return self._data_config
@@ -230,9 +290,68 @@ class ManifestDataLoader:
         self.prefix, self.task_counts, self.episode_counts = prefix, tasks, episodes
         self.committed_updates = completed_updates
 
+    def create_validation_loader(self):
+        rows = [row for row in self.draws.split["episodes"] if row["split"] == "validation"]
+        ids = [row["episode_id"] for row in rows]
+        if ids != list(self._data_config.validation_episode_indices):
+            raise ValueError("validation config/split episode identity mismatch")
+        if not rows:
+            return None
+        return ValidationDataLoader(
+            self._config,
+            self._data_config,
+            rows,
+            sharding=self.sharding,
+        )
+
     def close(self):
         if self._torch_loader is not None:
             iterator = getattr(self._torch_loader, "_iterator", None)
             if iterator is not None:
                 iterator._shutdown_workers()
         self.draws.close()
+
+
+class ValidationDataLoader:
+    def __init__(self, config, data_config, rows, *, sharding=None):
+        ids = [row["episode_id"] for row in rows]
+        native, transform = _native_and_transform(data_config, ids)
+        self.dataset = ValidationDataset(native, transform, rows)
+        self.batch_size = config.batch_size
+        self.workers = config.num_workers
+        self.sharding = sharding
+        kwargs = dict(
+            dataset=self.dataset,
+            batch_size=self.batch_size,
+            sampler=range(len(self.dataset)),
+            num_workers=self.workers,
+            collate_fn=data_loader._collate_fn,
+            drop_last=False,
+            worker_init_fn=worker_init,
+            generator=torch.Generator().manual_seed(0),
+        )
+        if self.workers:
+            kwargs.update(
+                multiprocessing_context=multiprocessing.get_context("spawn"),
+                persistent_workers=True,
+                prefetch_factor=2,
+            )
+        self._torch_loader = torch.utils.data.DataLoader(**kwargs)
+
+    def __len__(self):
+        return math.ceil(len(self.dataset) / self.batch_size)
+
+    def __iter__(self):
+        for batch in self._torch_loader:
+            if self.sharding is not None:
+                batch = jax.tree.map(
+                    lambda x: jax.make_array_from_process_local_data(self.sharding, x),
+                    batch,
+                )
+            yield model.Observation.from_dict(batch), batch["actions"]
+
+    def close(self):
+        if self._torch_loader is not None:
+            iterator = getattr(self._torch_loader, "_iterator", None)
+            if iterator is not None:
+                iterator._shutdown_workers()
