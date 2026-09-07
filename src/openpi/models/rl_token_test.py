@@ -7,6 +7,7 @@ import pytest
 from openpi.models.rl_token import ARToken
 from openpi.models.rl_token import ARTokenConfig
 from openpi.models.rl_token import validate_features
+from openpi.models.rl_token import compute_reconstruction_ablation_metrics
 
 
 def fixture():
@@ -32,6 +33,24 @@ def test_decoder_causal_and_token_dependence():
     changed = x.at[:, 2:].add(100)
     np.testing.assert_allclose(y[:, :3], token.decoder(z, changed, mask)[:, :3], atol=1e-6)
     assert not np.allclose(y[:, 0], token.decoder(jnp.zeros_like(z), x, mask)[:, 0])
+
+
+def test_first_token_diagnostic_uses_position_zero_and_valid_examples():
+    target = jnp.array([[[1.0, 2.0], [100.0, 100.0]], [[jnp.nan, jnp.nan], [50.0, 50.0]]])
+    mask = jnp.array([[True, True], [False, True]])
+    z = jnp.array([[1.0, 2.0], [3.0, 4.0]])
+
+    def decoder(token, target, mask):
+        return jnp.broadcast_to(token[:, None, :], target.shape)
+
+    metrics = compute_reconstruction_ablation_metrics(decoder, z, target, mask)
+    assert metrics["first_token_valid_count"] == 1
+    assert metrics["real_first_token_l2"] == 0
+    assert metrics["zero_first_token_l2"] == 5
+    assert metrics["shuffled_first_token_l2"] == 8
+    absent = compute_reconstruction_ablation_metrics(decoder, z, target, mask.at[:, 0].set(False))
+    assert absent["first_token_valid_count"] == 0
+    assert np.isnan(absent["real_first_token_l2"])
 
 
 def test_mask_validation_and_config():

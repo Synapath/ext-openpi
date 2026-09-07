@@ -189,12 +189,29 @@ def compute_reconstruction_ablation_metrics(
     shuffled_predictions = decoder_fn(shuffled_token, target_embeddings, mask)
     shuffled_loss = _reconstruction_loss(shuffled_predictions, target_embeddings, mask)
 
+    # Position zero has no preceding teacher-forced target. Do not substitute
+    # the first unmasked later position, which would have a different meaning.
+    first_valid = jnp.ones(target_embeddings.shape[0], dtype=bool) if mask is None else mask[:, 0]
+
+    def first_loss(predictions):
+        residual = jnp.where(first_valid[:, None], predictions[:, 0] - target_embeddings[:, 0], 0)
+        total = jnp.square(residual).sum()
+        return jnp.where(first_valid.any(), total / jnp.maximum(first_valid.sum(), 1), jnp.nan)
+
+    real_first, zero_first, shuffled_first = map(first_loss, (real_predictions, zero_predictions, shuffled_predictions))
+
     return {
         "real_recon_loss": float(real_loss),
         "zero_recon_loss": float(zero_loss),
         "shuffled_recon_loss": float(shuffled_loss),
         "zero_recon_gap": float(zero_loss - real_loss),
         "shuffled_recon_gap": float(shuffled_loss - real_loss),
+        "first_token_valid_count": int(first_valid.sum()),
+        "real_first_token_l2": float(real_first),
+        "zero_first_token_l2": float(zero_first),
+        "shuffled_first_token_l2": float(shuffled_first),
+        "zero_first_token_gap": float(zero_first - real_first),
+        "shuffled_first_token_gap": float(shuffled_first - real_first),
     }
 
 
