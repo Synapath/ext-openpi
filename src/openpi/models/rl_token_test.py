@@ -6,8 +6,8 @@ import pytest
 
 from openpi.models.rl_token import ARToken
 from openpi.models.rl_token import ARTokenConfig
-from openpi.models.rl_token import validate_features
 from openpi.models.rl_token import compute_reconstruction_ablation_metrics
+from openpi.models.rl_token import validate_features
 
 
 def fixture():
