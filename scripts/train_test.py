@@ -77,9 +77,9 @@ def test_numeric_wandb_excludes_paths_images_code_and_dependency_inventory(tmp_p
     assert "/private" not in json.dumps(first["config"])
     assert first["config"]["source_manifest_sha256"] == "a" * 64
     assert first["settings"].x_save_requirements is False
-    assert first["settings"].x_disable_machine_info is True
+    assert first["settings"].x_disable_machine_info is False
     assert first["settings"].x_disable_meta is True
-    assert first["settings"].x_disable_stats is True
+    assert first["settings"].x_disable_stats is False
     assert first["settings"].save_code is False
     assert first["settings"].console == "off"
     train.init_wandb(config, resuming=True, log_code=True)

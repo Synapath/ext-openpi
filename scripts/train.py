@@ -197,7 +197,7 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
     settings = None
     if config.wandb_numeric_only:
         settings = wandb.Settings(
-            disable_git=True, x_disable_meta=True, x_disable_stats=True, x_disable_machine_info=True,
+            disable_git=True, x_disable_meta=True, x_disable_stats=False, x_disable_machine_info=False,
             x_save_requirements=False, save_code=False, console="off",
         )
     if resuming:
