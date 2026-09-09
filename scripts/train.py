@@ -522,6 +522,31 @@ def main(config: _config.TrainConfig):
             _append_jsonl(metrics_path, serializable)
             infos = []
             interval_started = now
+        default_save = (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1
+        should_save = step in requested_checkpoint_steps if requested_checkpoint_steps is not None else default_save
+        if should_save:
+            save_started = time.perf_counter()
+            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            checkpoint_manager.wait_until_finished()
+            last_requested_checkpoint = step
+            checkpoint_info = {
+                "checkpoint_save_requested_step": step,
+                "checkpoint_save_enqueue_seconds": time.perf_counter() - save_started,
+            }
+            wandb_payload.update(checkpoint_info)
+            logging.info(
+                "Checkpoint save requested: step=%d enqueue_seconds=%.3f",
+                step,
+                checkpoint_info["checkpoint_save_enqueue_seconds"],
+            )
+
+        stop_at = float(os.environ.get("OPENPI_TRAIN_STOP_AT_UNIX", "inf"))
+        if time.time() >= stop_at and step + 1 < stage_end_update:
+            if last_requested_checkpoint != step:
+                _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+                checkpoint_manager.wait_until_finished()
+            raise RuntimeError("training reserve boundary reached; committed checkpoint saved")
+
         if validation_loader is not None and should_validate_step(
             step=step,
             stage_end_update=stage_end_update,
@@ -540,22 +565,6 @@ def main(config: _config.TrainConfig):
         if not exact_draws:
             batch = next(data_iter)
 
-        default_save = (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1
-        should_save = step in requested_checkpoint_steps if requested_checkpoint_steps is not None else default_save
-        if should_save:
-            save_started = time.perf_counter()
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
-            last_requested_checkpoint = step
-            checkpoint_info = {
-                "checkpoint_save_requested_step": step,
-                "checkpoint_save_enqueue_seconds": time.perf_counter() - save_started,
-            }
-            wandb_payload.update(checkpoint_info)
-            logging.info(
-                "Checkpoint save requested: step=%d enqueue_seconds=%.3f",
-                step,
-                checkpoint_info["checkpoint_save_enqueue_seconds"],
-            )
         if wandb_payload:
             wandb.log(wandb_payload, step=step)
         if exact_draws and step + 1 < stage_end_update:
