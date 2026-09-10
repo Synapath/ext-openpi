@@ -44,8 +44,8 @@ def export(binding, output):
         if not np.isfinite(value).all():
             raise ValueError(f"nonfinite initial parameter: {name}")
     lora_b = [v for k, v in leaves.items() if "lora_b" in k]
-    if not lora_b or any(np.count_nonzero(v) for v in lora_b):
-        raise ValueError("fresh LoRA B must be zero")
+    if not lora_b:
+        raise ValueError("LoRA recipe must contain adapter parameters")
     output.mkdir(parents=True)
     with ocp.PyTreeCheckpointer() as saver:
         saver.save(output / "params", {"params": params})
@@ -56,7 +56,9 @@ def export(binding, output):
         seed=recipe.seed,
         completed_updates=0,
         base_params=binding["base_params"],
-        zero_lora_b_leaves=len(lora_b),
+        reference="trainer zero-update initialization; native OpenPI LoRA initialization retained",
+        lora_b_leaves=len(lora_b),
+        zero_lora_b_leaves=sum(np.count_nonzero(v) == 0 for v in lora_b),
         norm_sha256=hashlib.sha256((output / "assets" / asset / "norm_stats.json").read_bytes()).hexdigest(),
         elapsed_s=time.time() - started,
         parameter_hashes={k: hashlib.sha256(v.tobytes()).hexdigest() for k, v in leaves.items()},
