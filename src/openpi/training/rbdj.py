@@ -51,7 +51,7 @@ def verify_draws(draws: DrawManifest) -> dict:
 
 def temporal_mask(item, split, row, frame):
     """Cross-check native padding and exclude the source's fake final action."""
-    from manip_datasets.robodojo_pi05 import MASKED_SCHEMA
+    from manip_datasets.robodojo_pi05 import MASKED_SCHEMAS
     from manip_datasets.robodojo_pi05 import valid_length
 
     horizon = split["horizon"]
@@ -59,7 +59,7 @@ def temporal_mask(item, split, row, frame):
     expected_pad = np.arange(horizon) + frame >= row["length"]
     if native_pad.shape != (horizon,) or not np.array_equal(native_pad, expected_pad):
         raise ValueError("native temporal padding differs from source episode length")
-    if split["schema"] != MASKED_SCHEMA:
+    if split["schema"] not in MASKED_SCHEMAS:
         if native_pad.any():
             raise ValueError("unexpected temporal padding at complete anchor")
         return None
@@ -131,9 +131,9 @@ class ManifestDataLoader:
             raise ValueError("G2 requires single-process JAX with a positive batch")
         self.draws = DrawManifest(data_config.draw_manifest_path, data_config.split_manifest_path, verify=False)
         verify_draws(self.draws)
-        from manip_datasets.robodojo_pi05 import MASKED_SCHEMA
+        from manip_datasets.robodojo_pi05 import MASKED_SCHEMAS
 
-        if config.mask_action_padding != (self.draws.split["schema"] == MASKED_SCHEMA):
+        if config.mask_action_padding != (self.draws.split["schema"] in MASKED_SCHEMAS):
             raise ValueError("configured loss mask does not match split profile")
         if self.draws.split["horizon"] != config.model.action_horizon:
             raise ValueError("model/draw horizon mismatch")

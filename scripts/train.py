@@ -311,7 +311,8 @@ def train_step(
             squared = model.compute_loss_components(rng, observation, actions, train=True)
             return jnp.mean(
                 _model.weight_action_loss(jnp.mean(squared, axis=-1), observation.action_valid_mask)
-            ), diagnostics.flow_metrics(squared, valid_mask=observation.action_valid_mask)
+            ), diagnostics.flow_metrics(squared, valid_mask=observation.action_valid_mask,
+                                        execution_horizon=(config.policy_metadata or {}).get("execution_horizon", 16))
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
         return jnp.mean(chunked_loss), {}
 

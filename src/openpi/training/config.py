@@ -1006,6 +1006,21 @@ _CONFIGS.append(TrainConfig(
                      "execution_horizon": 16, "state_action_dim": 14, "adapt_to_pi": False},
 ))
 
+# Same supervised recipe, with an independent task/data identity. Runtime paths
+# are explicitly bound by the launcher; no charger checkpoint/norm is inherited.
+_charger_sft = next(c for c in _CONFIGS if c.name == "pi05_rlt_charger_r1_0a")
+_CONFIGS.append(dataclasses.replace(
+    _charger_sft,
+    name="pi05_rlt_tubes_r2_0b",
+    data=dataclasses.replace(
+        _charger_sft.data,
+        repo_id="RoboDojo-rlt-tubes-h32-masked-v1",
+        assets=AssetsConfig(asset_id="tubes-h32-masked-v1"),
+    ),
+    policy_metadata={"plan_id": "R2.0B", "task": "insert_tubes", "prediction_horizon": 32,
+                     "execution_horizon": 10, "state_action_dim": 14, "adapt_to_pi": False},
+))
+
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}

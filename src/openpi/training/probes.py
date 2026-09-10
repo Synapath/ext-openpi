@@ -156,7 +156,8 @@ class FixedProbes:
             def one(obs, target, key):
                 obs = jax.tree.map(lambda x: x[None], obs)
                 squared = m.compute_loss_components(key, obs, target[None], train=False)
-                return diagnostics.flow_metrics(squared, valid_mask=obs.action_valid_mask)
+                return diagnostics.flow_metrics(squared, valid_mask=obs.action_valid_mask,
+                                                execution_horizon=(self.config.policy_metadata or {}).get("execution_horizon", 16))
 
             return jax.vmap(one)(observation, actions, keys)
 

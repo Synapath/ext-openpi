@@ -3,7 +3,6 @@
 import hashlib
 import json
 from pathlib import Path
-import subprocess
 
 from flax import traverse_util
 import jax
@@ -50,28 +49,11 @@ def trainable_health(state, config):
 
 
 def system_metrics():
-    # These are explicit history metrics, not W&B's separate system stream.
-    # The system/ prefix makes sampled chart queries resolve to that empty stream.
+    # Standard host/GPU telemetry belongs to the SDK's native System stream.
+    # Only JAX allocator information needs a separate history metric.
     result = {}
-    try:
-        text = subprocess.check_output(
-            [
-                "nvidia-smi",
-                "--query-gpu=index,memory.used,utilization.gpu,temperature.gpu",
-                "--format=csv,noheader,nounits",
-            ],
-            text=True,
-            timeout=5,
-        )
-        for line in text.splitlines():
-            index, memory, util, temp = [int(x.strip()) for x in line.split(",")]
-            for key, val in (("gpu_memory_reserved_mib", memory), ("gpu_util", util), ("temperature_c", temp)):
-                result[f"hardware/gpu{index}/{key}"] = val
-        result["hardware/nvml_available"] = 1
-    except (OSError, ValueError, subprocess.SubprocessError):
-        result["hardware/nvml_available"] = 0
     for device in jax.local_devices():
         stats = device.memory_stats()
         if stats and "peak_bytes_in_use" in stats:
-            result[f"hardware/gpu{device.id}/jax_peak_active_gib"] = stats["peak_bytes_in_use"] / 2**30
+            result[f"memory/jax/gpu{device.id}/peak_active_gib"] = stats["peak_bytes_in_use"] / 2**30
     return result
